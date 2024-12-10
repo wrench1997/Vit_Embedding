@@ -13,6 +13,7 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 from lightly.loss import NTXentLoss
+from embed.net_emded import ConvNet,SimCLRProjectionHead
 
 # Data augmentation: Generate two different augmented views
 transform_simclr = transforms.Compose([
@@ -42,66 +43,7 @@ class SimCLRDataset(Dataset):
             xj = self.transform(image)
         return xi, xj
         
-class ConvBlock(nn.Module):
-    def __init__(self, dropout_rate, n_in, n_out, kernel_size):
-        super(ConvBlock, self).__init__()
-        self.conv = nn.Conv2d(n_in, n_out, kernel_size=kernel_size, stride=1, padding=kernel_size // 2)
-        self.bn = nn.BatchNorm2d(n_out)
-        self.dropout = nn.Dropout2d(dropout_rate)
-        self.relu = nn.ReLU(inplace=True)
 
-    def forward(self, x):
-        x = self.conv(x)
-        x = self.bn(x)
-        x = self.dropout(x)
-        x = self.relu(x)
-        return x
-
-class FullyConnectedBlock(nn.Module):
-    def __init__(self, dropout_rate, n_in, n_out):
-        super(FullyConnectedBlock, self).__init__()
-        self.fc = nn.Linear(n_in, n_out)
-        self.bn = nn.BatchNorm1d(n_out)
-        self.dropout = nn.Dropout(dropout_rate)
-        self.relu = nn.ReLU(inplace=True)
-
-    def forward(self, x):
-        x = self.fc(x)
-        x = self.bn(x)
-        x = self.dropout(x)
-        x = self.relu(x)
-        return x
-
-class ConvNet(nn.Module):
-    def __init__(self, input_shape, output_size, dropout_rate=0.0):
-        super(ConvNet, self).__init__()
-        n_input_channels, height, width = input_shape
-        self.block1 = ConvBlock(dropout_rate, n_in=n_input_channels, n_out=32, kernel_size=5)
-        self.block2 = ConvBlock(dropout_rate, n_in=32, n_out=64, kernel_size=5)
-        self.flatten_dim = 64 * (height // 4) * (width // 4)  # Update to calculate dynamically
-        self.block3 = FullyConnectedBlock(dropout_rate, n_in=self.flatten_dim, n_out=128)
-        self.fc = nn.Linear(128, output_size)
-
-    def forward(self, x):
-        x = self.block1(x)
-        x = F.max_pool2d(x, kernel_size=2)
-        x = self.block2(x)
-        x = F.max_pool2d(x, kernel_size=2)
-        x = x.flatten(start_dim=1)
-        x = self.block3(x)
-        x = self.fc(x)
-        return x
-
-class SimCLRProjectionHead(nn.Module):
-    def __init__(self, input_dim, hidden_dim):
-        super(SimCLRProjectionHead, self).__init__()
-        self.fc1 = nn.Linear(input_dim, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, input_dim)
-
-    def forward(self, x):
-        x = F.relu(self.fc1(x))
-        x = self.fc2(x)
-        return x
 
 # Data preparation
 train_dir = './data/output_dir/train'  # Dataset path
