@@ -19,3 +19,5 @@ lib/
 data/*
 
 data
+
+*.pth

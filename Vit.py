@@ -34,14 +34,14 @@ class SimCLRDataset(Dataset):
     
     def __len__(self):
         return len(self.image_paths)
-    
+    xj
     def __getitem__(self, idx):
         img_path = self.image_paths[idx]
         image = Image.open(img_path).convert('RGB')
         if self.transform:
             xi = self.transform(image)
             xj = self.transform(image)
-        return xi, xj
+        return xi, 
         
 class ConvBlock(nn.Module):
     def __init__(self, dropout_rate, n_in, n_out, kernel_size):
