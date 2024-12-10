@@ -15,11 +15,11 @@ import torch.nn.functional as F
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 input_shape = (3, 64, 36)
-embed_dim = 2048
+embed_dim = 1024
 hidden_dim = 64
 
-encoder_path = 'checkpoint/encoder_epoch_latset.pth'
-projection_head_path = 'checkpoint/proj_head_epoch_latset.pth'
+encoder_path = 'checkpoint/encoder_epoch_latset_min_loss.pth'
+projection_head_path = 'checkpoint/proj_head_epoch_latset_min_loss.pth'
 
 encoder, projection_head = load_embedding_model(encoder_path, projection_head_path, input_shape, embed_dim, hidden_dim, device)
 
@@ -333,7 +333,7 @@ def sample(model, diffusion, init_frame, device, num_future=8, C=4, H=360, W=640
 ########################################
 # 训练函数
 ########################################
-def train_model(model, diffusion, dataloader, device, epochs=10, lr=1e-4):
+def train_model(model, diffusion, dataloader, device, epochs=10, lr=1e-5):
     optimizer = optim.SGD(model.parameters(), lr=lr)
     model.train()
     for epoch in range(epochs):
@@ -367,10 +367,10 @@ if __name__ == "__main__":
     T, C, H, W = sample_future_frames.shape
 
     input_dim = 64 * 36
-    embed_dim = 2048  # 更大的嵌入维度
+    embed_dim = 1024  # 更大的嵌入维度
     num_heads = 8  # 更多的注意力头
     num_layers = 4  # 堆叠更多的解码器层
-    feedforward_dim = 2048  # 前馈网络的更大维度
+    feedforward_dim = 1024  # 前馈网络的更大维度
     model = GPT2Decoder(embed_dim=embed_dim, 
                         num_heads=num_heads,
                         num_layers=num_layers,
@@ -380,12 +380,18 @@ if __name__ == "__main__":
 
     model_path = "model_epoch_leaset.pth"  # 加载模型权重
     # 加载模型权重
-    model.load_state_dict(torch.load(model_path, map_location=device))
-    model.train()
+    # 检查文件是否存在
+    if os.path.exists(model_path):
+        # 加载模型权重
+        model.load_state_dict(torch.load(model_path, map_location=device))
+        model.eval()
+    else:
+        print(f"模型文件 {model_path} 不存在，跳过加载。")
+
 
     istrain = True
     if istrain:
-        train_model(model, diffusion, dataloader, device, epochs=100, lr=1e-5)
+        train_model(model, diffusion, dataloader, device, epochs=1000, lr=1e-5)
     else:
         # 推理示例（从数据集中取一个样本）
         init_frame, future_frames = dataset[0]  # future_frames: (T, C, H, W)
