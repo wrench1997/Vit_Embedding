@@ -73,6 +73,7 @@ class UNet(nn.Module):
         self.outc = nn.Conv2d(64, out_channels, 1)
         
     def forward(self, x, cond):
+        cond = cond.expand(x.size(0), -1, -1, -1)  # 或使用 repeat: cond = cond.repeat(x.size(0), 1, 1, 1)
         inp = torch.cat([x, cond], dim=1)  # [B, T*C + C, H, W]
         
         x1 = self.inc(inp)
@@ -231,94 +232,70 @@ if __name__ == "__main__":
     # 推理示例（从数据集中取一个样本）
     init_frame, future_frames = dataset[0]  # future_frames: (T, C, H, W)
     T, C, H, W = future_frames.shape
+    num_samples = 2
     
     # 使用模型采样生成未来T帧
-    predicted_frames = sample(model, diffusion, init_frame, device, num_future=T, C=C, H=H, W=W, num_samples=1)
-    # predicted_frames shape: (1, T, C, H, W)
-    predicted_frames = predicted_frames[0]  # (T, C, H, W)
-
-    # 若模型生成的像素不在[0,1]范围，需要归一化。例如：
-    # predicted_frames = (predicted_frames - predicted_frames.min()) / (predicted_frames.max()-predicted_frames.min())
-    # future_frames = (future_frames - future_frames.min()) / (future_frames.max()-future_frames.min())
-
-    # 这里假设future_frames和predicted_frames都在[0,1]范围内
-    # 对每一帧计算SSIM，再求平均
-    # ssim_values = []
-    # for i in range(T):
-    #     # SSIM期望输入形状为 (N, C, H, W) 且在[0,1]范围
-    #     frame_gt = future_frames[i].unsqueeze(0).to(device)      # (1, C, H, W)
-    #     frame_pred = predicted_frames[i].unsqueeze(0).to(device) # (1, C, H, W)
-    #     ssim_val = ssim_metric(frame_pred, frame_gt, data_range=1.0, size_average=True)
-    #     ssim_values.append(ssim_val.item())
-    
-    # avg_ssim = np.mean(ssim_values)
-    # print(f"Average SSIM between predicted and ground truth frames: {avg_ssim}")
-
-    # 显示图片
-    # 转换为CPU并转为numpy
+    predicted_frames = sample(model, diffusion, init_frame, device, num_future=T, C=C, H=H, W=W, num_samples=num_samples)
+    # predicted_frames shape: (2, T, C, H, W)
+    # 转换为 CPU 并转为 numpy
     initial_frame_np = init_frame.cpu().numpy().transpose(1, 2, 0)  # (H, W, C)
     future_frames_np = future_frames.cpu().numpy()  # (T, C, H, W)
-    predicted_frames_np = predicted_frames.cpu().numpy()  # (T, C, H, W)
-
+    predicted_frames_np = predicted_frames.numpy()  # (num_samples, T, C, H, W)
+    
     # 创建一个新的图形
-    num_cols = 3  # Initial, Ground Truth, Predicted
+    num_cols = 4  # Initial, Ground Truth, Predicted 1, Predicted 2
     num_rows = T
-    plt.figure(figsize=(15, 5 * T))
-
-    for i in range(T):
-        # Ground Truth Frame
-        plt.subplot(num_rows, num_cols, i * num_cols + 1)
-        if C == 1:
-            plt.imshow(future_frames_np[i, 0], cmap='gray')
-        elif C == 3 or C == 4:
-            # 转置为 (H, W, C)
-            frame_gt = future_frames_np[i].transpose(1, 2, 0)
-            if C == 4:
-                # 如果是RGBA图像，可以选择忽略Alpha通道或处理
-                frame_gt = frame_gt[:, :, :3]  # 只取RGB
-            plt.imshow(frame_gt.clip(0,1))
-        else:
-            # 如果有其他通道数，选择第一个通道显示
-            plt.imshow(future_frames_np[i, 0], cmap='gray')
-        plt.title(f"Ground Truth Frame {i+1}")
-        plt.axis('off')
-
-        # Predicted Frame
-        plt.subplot(num_rows, num_cols, i * num_cols + 2)
-        if C == 1:
-            plt.imshow(predicted_frames_np[i, 0], cmap='gray')
-        elif C == 3 or C == 4:
-            # 转置为 (H, W, C)
-            frame_pred = predicted_frames_np[i].transpose(1, 2, 0)
-            if C == 4:
-                # 如果是RGBA图像，可以选择忽略Alpha通道或处理
-                frame_pred = frame_pred[:, :, :3]  # 只取RGB
-            plt.imshow(frame_pred.clip(0,1))
-        else:
-            plt.imshow(predicted_frames_np[i, 0], cmap='gray')
-        plt.title(f"Predicted Frame {i+1}")
-        plt.axis('off')
-
-        # Difference或Overlay（可选）
-        plt.subplot(num_rows, num_cols, i * num_cols + 3)
-        if C == 1:
-            difference = np.abs(future_frames_np[i, 0] - predicted_frames_np[i, 0])
-            plt.imshow(difference, cmap='hot')
-        elif C == 3 or C == 4:
-            # 计算差异并转置
-            difference = np.abs(future_frames_np[i] - predicted_frames_np[i])
-            if C == 4:
-                difference = difference[:3, :, :]  # 只取RGB差异
-            difference = difference.transpose(1, 2, 0)
-            # 可以选择将差异归一化
-            difference = (difference - difference.min()) / (difference.max() - difference.min() + 1e-8)
-            plt.imshow(difference, cmap='hot')
-        else:
-            difference = np.abs(future_frames_np[i, 0] - predicted_frames_np[i, 0])
-            plt.imshow(difference, cmap='hot')
-        plt.title(f"Difference Frame {i+1}")
-        plt.axis('off')
-
+    plt.figure(figsize=(20, 5 * T))
+    
+    for sample_idx in range(num_samples):
+        # ssim_values = []
+        # for t in range(T):
+        #     # SSIM 计算
+        #     frame_gt = future_frames_np[t].transpose(1, 2, 0)  # (H, W, C)
+        #     frame_pred = predicted_frames_np[sample_idx, t].transpose(1, 2, 0)  # (H, W, C)
+            
+        #     # 转换为 torch 张量并添加批次维度
+        #     frame_gt_tensor = torch.from_numpy(frame_gt).permute(2, 0, 1).unsqueeze(0).to(device).float()
+        #     frame_pred_tensor = torch.from_numpy(frame_pred).permute(2, 0, 1).unsqueeze(0).to(device).float()
+            
+        #     # 计算 SSIM
+        #     ssim_val = ssim_metric(frame_pred_tensor, frame_gt_tensor, data_range=1.0, size_average=True)
+        #     ssim_values.append(ssim_val.item())
+        
+        # avg_ssim = np.mean(ssim_values)
+        # print(f"Average SSIM for Prediction {sample_idx+1}: {avg_ssim:.4f}")
+        
+        # 可视化
+        for t in range(T):
+            # Ground Truth Frame
+            plt.subplot(num_rows, num_cols, t * num_cols + 1)
+            if C == 1:
+                plt.imshow(future_frames_np[t, 0], cmap='gray')
+            elif C == 3 or C == 4:
+                frame_gt = future_frames_np[t].transpose(1, 2, 0)
+                if C == 4:
+                    frame_gt = frame_gt[:, :, :3]  # 只取 RGB
+                plt.imshow(frame_gt.clip(0,1))
+            else:
+                plt.imshow(future_frames_np[t, 0], cmap='gray')
+            if sample_idx == 0:
+                plt.title(f"Ground Truth Frame {t+1}")
+            plt.axis('off')
+    
+            # Predicted Frame
+            plt.subplot(num_rows, num_cols, t * num_cols + 2 + sample_idx)
+            if C == 1:
+                plt.imshow(predicted_frames_np[sample_idx, t, 0], cmap='gray')
+            elif C == 3 or C == 4:
+                frame_pred = predicted_frames_np[sample_idx, t].transpose(1, 2, 0)
+                if C == 4:
+                    frame_pred = frame_pred[:, :, :3]  # 只取 RGB
+                plt.imshow(frame_pred.clip(0,1))
+            else:
+                plt.imshow(predicted_frames_np[sample_idx, t, 0], cmap='gray')
+            plt.title(f"Predicted {sample_idx+1} Frame {t+1}")
+            plt.axis('off')
+    
     plt.tight_layout()
     plt.show()
     input("Press Enter to exit...")  # 暂停程序，等待用户输入
