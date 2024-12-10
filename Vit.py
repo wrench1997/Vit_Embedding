@@ -16,7 +16,7 @@ from lightly.loss import NTXentLoss
 
 # Data augmentation: Generate two different augmented views
 transform_simclr = transforms.Compose([
-    transforms.RandomResizedCrop(size=(640, 360)),
+    transforms.RandomResizedCrop(size=(64, 36)),
     transforms.RandomHorizontalFlip(),
     transforms.ColorJitter(0.4, 0.4, 0.4, 0.1),
     transforms.RandomGrayscale(p=0.2),
@@ -34,14 +34,13 @@ class SimCLRDataset(Dataset):
     
     def __len__(self):
         return len(self.image_paths)
-    xj
     def __getitem__(self, idx):
         img_path = self.image_paths[idx]
         image = Image.open(img_path).convert('RGB')
         if self.transform:
             xi = self.transform(image)
             xj = self.transform(image)
-        return xi, 
+        return xi, xj
         
 class ConvBlock(nn.Module):
     def __init__(self, dropout_rate, n_in, n_out, kernel_size):
@@ -105,12 +104,12 @@ class SimCLRProjectionHead(nn.Module):
         return x
 
 # Data preparation
-train_dir = './data/train'  # Dataset path
-batch_size = 32
+train_dir = './data/output_dir/train'  # Dataset path
+batch_size = 4
 transform = transform_simclr
 
-input_shape = (3, 640, 360)
-embed_dim = 128
+input_shape = (3, 64, 36)
+embed_dim = 2048
 
 dataset = SimCLRDataset(root_dir=train_dir, transform=transform)
 train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0, drop_last=True)
@@ -127,7 +126,7 @@ params = chain(encoder.parameters(), projection_head.parameters())
 optimizer = optim.Adam(params, lr=3e-4, weight_decay=1e-4)
 
 # Training loop
-num_epochs = 20
+num_epochs = 1000
 steps, losses = [], []
 
 for epoch in range(num_epochs):
@@ -157,8 +156,8 @@ for epoch in range(num_epochs):
     steps.append(epoch)
     losses.append(epoch_loss)
 
-    # Save model (optional)
-    torch.save(encoder.state_dict(), f'encoder_epoch{epoch+1}.pth')
-    torch.save(projection_head.state_dict(), f'proj_head_epoch{epoch+1}.pth')
+# Save model (optional)
+torch.save(encoder.state_dict(), f'checkpoint/encoder_epoch_latset.pth')
+torch.save(projection_head.state_dict(), f'checkpoint/proj_head_epoch_latset.pth')
 
 print("Pretraining complete!")
