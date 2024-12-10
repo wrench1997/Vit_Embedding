@@ -45,6 +45,38 @@ class SimCLRDataset(Dataset):
         
 
 
+
+class Decoder(nn.Module):
+    def __init__(self, embed_dim, output_channels=3, input_shape=(64, 36)):
+        super(Decoder, self).__init__()
+        self.fc1 = nn.Linear(embed_dim, 512)  # 输入是嵌入向量，输出是中间层
+        self.fc2 = nn.Linear(512, 1024)  # 第二个全连接层
+        self.fc3 = nn.Linear(1024, input_shape[0] * input_shape[1] * output_channels)  # 还原为图像的平面形式
+
+        self.deconv1 = nn.ConvTranspose2d(output_channels, 64, kernel_size=4, stride=2, padding=1)  # 转置卷积层
+        self.deconv2 = nn.ConvTranspose2d(64, 32, kernel_size=4, stride=2, padding=1)
+        self.deconv3 = nn.ConvTranspose2d(32, output_channels, kernel_size=4, stride=2, padding=1)
+        self.tanh = nn.Tanh()
+
+    def forward(self, x):
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        x = F.relu(self.fc3(x))
+        
+        # 将向量变为图像形状
+        x = x.view(x.size(0), 3, 64, 36)  # 假设原始图像尺寸为 (3, 64, 36)
+        
+        # 转置卷积层
+        x = self.deconv1(x)
+        x = self.deconv2(x)
+        x = self.deconv3(x)
+        
+        return self.tanh(x)  # 输出图像
+
+
+
+
+
 # Data preparation
 train_dir = './data/output_dir/train'  # Dataset path
 batch_size = 4
