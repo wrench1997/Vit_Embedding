@@ -8,6 +8,20 @@ from tqdm import tqdm
 from pytorch_msssim import ssim as ssim_metric
 import matplotlib.pyplot as plt  # Added for visualization
 from torchvision import transforms
+from embed.net_emded import load_embedding_model,prepare_transform,get_embedding
+import torch.nn.functional as F
+
+
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+input_shape = (3, 64, 36)
+embed_dim = 2048
+hidden_dim = 64
+
+encoder_path = 'checkpoint/encoder_epoch_latset.pth'
+projection_head_path = 'checkpoint/proj_head_epoch_latset.pth'
+
+encoder, projection_head = load_embedding_model(encoder_path, projection_head_path, input_shape, embed_dim, hidden_dim, device)
 
 
 
@@ -15,56 +29,36 @@ from torchvision import transforms
 
 
 
-
-
-
-
-class TransformerDecoderNetwork(nn.Module):
-    def __init__(self, input_dim, embed_dim, num_heads, num_layers, feedforward_dim):
-        super(TransformerDecoderNetwork, self).__init__()
-        # 定义输入投影层
-        self.input_projection = nn.Linear(input_dim, embed_dim)
-        
-        # 定义解码器层
-        self.decoder_layers = nn.ModuleList([
-            nn.TransformerDecoderLayer(
-                d_model=embed_dim,
-                nhead=num_heads,
-                dim_feedforward=feedforward_dim,
-                activation="relu"
-            )
+class GPT2Decoder(nn.Module):
+    def __init__(self, embed_dim, num_heads, num_layers, feedforward_dim):
+        super(GPT2Decoder, self).__init__()
+        self.layers = nn.ModuleList([
+            nn.ModuleDict({
+                "attn": nn.MultiheadAttention(embed_dim, num_heads),
+                "ffn": nn.Sequential(
+                    nn.Linear(embed_dim, feedforward_dim),
+                    nn.ReLU(),
+                    nn.Linear(feedforward_dim, embed_dim)
+                ),
+                "ln1": nn.LayerNorm(embed_dim),
+                "ln2": nn.LayerNorm(embed_dim)
+            })
             for _ in range(num_layers)
         ])
-        
-        # 输出投影层
-        self.output_projection = nn.Linear(embed_dim, input_dim)
-    
-    def forward(self, x):
-        # x 的初始形状为 (batch_size, height, width)
-        batch_size, height, width = x.shape
-        assert batch_size == 4, "Batch size must be 4 to reshape to the target shape"
-        
-        # Flatten spatial dimensions
-        x = x.view(batch_size, height * width)  # (batch_size, seq_len)
-        x = self.input_projection(x)  # (batch_size, seq_len, embed_dim)
-        
-        # 使用输入本身作为 query 和 memory（键值对）
-        query = x.unsqueeze(0).permute(1, 0, 2)  # (seq_len, batch_size, embed_dim)
-        memory = x.unsqueeze(0).permute(1, 0, 2)  # (seq_len, batch_size, embed_dim)
-        
-        # 通过多层解码器
-        for layer in self.decoder_layers:
-            query = layer(query, memory)  # 解码器的输出 (seq_len, batch_size, embed_dim)
-        
-        # 调整回原始维度
-        x = query.permute(1, 0, 2)  # (batch_size, seq_len, embed_dim)
-        x = self.output_projection(x)  # (batch_size, seq_len, input_dim)
-        x = x.view(batch_size, height, width)  # 恢复到 (batch_size, height, width)
-        
-        # 调整为目标形状 (2, 8, 4, 360, 640)
-        x = x.unsqueeze(0).repeat(2, 8, 1, 1, 1)
-        return x
 
+    def forward(self, x):
+        for layer in self.layers:
+            # Multihead self-attention
+            attn_output, _ = layer["attn"](x, x, x)
+            x = x + attn_output
+            x = layer["ln1"](x)
+
+            # Feedforward network
+            ffn_output = layer["ffn"](x)
+            x = x + ffn_output
+            x = layer["ln2"](x)
+
+        return x
 
 
 ########################################
@@ -85,11 +79,16 @@ class SegmentDataset(Dataset):
         initial_frame = data["initial_frame"]["img"]  # (H, W, C)
         future_frames = [f["img"] for f in data["future_frames"]]  # (T, H, W, C)
 
-        # 转为tensor (C, H, W)
-        initial_frame = torch.from_numpy(initial_frame).permute(2, 0, 1).float()
-        
+        # 转为tensor (C, W, H)
+        initial_frame = torch.from_numpy(initial_frame).permute(2, 1, 0).float()
+
+        # 缩放到目标尺寸 (64, 36)
+        initial_frame = F.interpolate(initial_frame.unsqueeze(0), size=(36, 64), mode='bilinear', align_corners=False)
+        initial_frame = initial_frame.squeeze(0)  # 去掉 batch 维度
+
         future_frames = np.stack(future_frames, axis=0)  # (T, H, W, C)
-        future_frames = torch.from_numpy(future_frames).permute(0, 3, 1, 2).float()  # (T, C, H, W)
+        future_frames = torch.from_numpy(future_frames).permute(0, 3, 2, 1).float()  # (T, C, W, H)
+        future_frames = F.interpolate(future_frames, size=(36, 64), mode='bilinear', align_corners=False)
         
         return initial_frame, future_frames
 
@@ -165,28 +164,6 @@ def linear_beta_schedule(timesteps, start=1e-4, end=0.02):
 
 normalize_transform = transforms.Normalize(mean=[0.5,0.485, 0.456, 0.406], std=[0.5,0.229, 0.224, 0.225])
 
-def process_video(video):
-
-    batch_size, num_frames,C, height, width = video.shape
-
-    # 扩展通道维度 (假设是单通道，扩展为 RGB)
-    # video = video.unsqueeze(2)  # (Batch, Frames, Channels=1, H, W)
-    # video = video.expand(-1, -1, 3, -1, -1)  # 扩展为 RGB 3 通道
-
-    # # 重新组织形状 (Batch × Frames, Channels, H, W)
-    # video = video.reshape(-1, 3, height, width)
-
-    # 应用变换
-    transform = transforms.Compose([
-        # resize_transform,   # 调整大小
-        normalize_transform # 标准化
-    ])
-    video = torch.stack([transform(frame) for frame in video])
-
-    # 恢复到原始视频形状 (Batch, Frames, Channels, H, W)
-    video = video.view(batch_size, num_frames, C, height, width)
-    return video
-
 class Diffusion:
     def __init__(self, timesteps=1000, device='cpu'):
         self.timesteps = timesteps
@@ -213,8 +190,6 @@ class Diffusion:
         # x_noisy = self.q_sample(x_start, t, noise=noise)
         cond = cond[0]
         noise_pred = model(cond)
-        # normalized_image  = process_video(ref_future_frames)
-        # 计算MSE损失
         loss_mse = ((x_start - noise_pred) ** 2).mean()
         
         # 计算SSIM损失
@@ -302,20 +277,16 @@ if __name__ == "__main__":
     # 获取一个样本以确定 T 和 C
     sample_init_frame, sample_future_frames = dataset[0]  # future_frames: (T, C, H, W)
     T, C, H, W = sample_future_frames.shape
-    
-    # 计算 in_channels 和 out_channels
-    in_channels = T * C + C  # 8 * 4 + 4 = 36
-    out_channels = T * C     # 8 * 4 = 32
-    input_dim = 360 * 640
-    embed_dim = 512  # 更大的嵌入维度
+
+    input_dim = 64 * 36
+    embed_dim = 2048  # 更大的嵌入维度
     num_heads = 8  # 更多的注意力头
     num_layers = 4  # 堆叠更多的解码器层
     feedforward_dim = 2048  # 前馈网络的更大维度
-    model = TransformerDecoderNetwork(input_dim=input_dim, 
-                                      embed_dim=embed_dim, 
-                                      num_heads=num_heads,
-                                      num_layers=num_layers,
-                                      feedforward_dim=feedforward_dim).to(device=device)
+    model = GPT2Decoder(embed_dim=embed_dim, 
+                        num_heads=num_heads,
+                        num_layers=num_layers,
+                        feedforward_dim=feedforward_dim).to(device=device)
 
     diffusion = Diffusion(timesteps=1000, device=device)  # 传递设备
 
