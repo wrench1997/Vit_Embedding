@@ -45,6 +45,7 @@ class GPT2Decoder(nn.Module):
             })
             for _ in range(num_layers)
         ])
+        self.map_layer = AttentionMapper(embed_dim=embed_dim, num_heads=num_heads).to(device)
 
     def forward(self, x):
         
@@ -59,6 +60,17 @@ class GPT2Decoder(nn.Module):
             x = x + ffn_output
             x = layer["ln2"](x)
 
+
+        # max_val = x.max()
+        # min_val = x.min()
+        # x = (attn_output - min_val) / (max_val - min_val) * (4 - (-3)) + (-3)
+
+        x = self.map_layer(x)
+
+
+        max_val = x.max()
+        min_val = x.min()
+        x = (attn_output - min_val) / (max_val - min_val) * (max_val - min_val) + min_val
         return x
     
 
@@ -136,7 +148,45 @@ class DoubleConv(nn.Module):
         )
     def forward(self, x):
         return self.net(x)
+    
+class AttentionMapper(nn.Module):
+    def __init__(self, embed_dim, num_heads, num_queries=8):
+        super(AttentionMapper, self).__init__()
+        self.num_queries = num_queries
+        self.embed_dim = embed_dim
 
+        # 自定义的 KQV 权重
+        self.key_layer = nn.Linear(embed_dim, embed_dim)
+        self.query_layer = nn.Linear(embed_dim, embed_dim)
+        self.value_layer = nn.Linear(embed_dim, embed_dim)
+
+        # 多头注意力机制
+        self.multihead_attn = nn.MultiheadAttention(embed_dim=embed_dim, num_heads=num_heads)
+
+        # Layer normalization
+        self.layer_norm = nn.LayerNorm(embed_dim)
+
+    def forward(self, x):
+        # x: 输入 (batch_size, 1, embed_dim)
+        batch_size = x.size(0)
+
+        # 提取查询、键和值
+        query = self.query_layer(x).permute(1, 0, 2)  # (batch_size, 1, embed_dim) -> (1, batch_size, embed_dim)
+        key = self.key_layer(x).permute(1, 0, 2)  # (batch_size, 1, embed_dim) -> (1, batch_size, embed_dim)
+        value = self.value_layer(x).permute(1, 0, 2)  # (batch_size, 1, embed_dim) -> (1, batch_size, embed_dim)
+
+        # 通过多头注意力机制
+        attn_output, _ = self.multihead_attn(query, key, value)  # attn_output shape: (1, batch_size, embed_dim)
+
+        # Layer normalization
+        attn_output = self.layer_norm(attn_output)
+
+        # Adjust shape to (num_queries, 1, 1, embed_dim)
+        attn_output = attn_output.permute(1, 0, 2).unsqueeze(2).expand(batch_size, self.num_queries, 1, self.embed_dim)
+        attn_output = attn_output.permute(1, 0, 2,3)
+        return attn_output
+
+    
 class UNet(nn.Module):
     def __init__(self, in_channels=36, out_channels=32): 
         """
@@ -284,7 +334,7 @@ def sample(model, diffusion, init_frame, device, num_future=8, C=4, H=360, W=640
 # 训练函数
 ########################################
 def train_model(model, diffusion, dataloader, device, epochs=10, lr=1e-4):
-    optimizer = optim.Adam(model.parameters(), lr=lr)
+    optimizer = optim.SGD(model.parameters(), lr=lr)
     model.train()
     for epoch in range(epochs):
         pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs}")
@@ -298,7 +348,6 @@ def train_model(model, diffusion, dataloader, device, epochs=10, lr=1e-4):
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            
             pbar.set_postfix({"loss": loss.item()})
     
         # 可选：保存模型
@@ -329,14 +378,14 @@ if __name__ == "__main__":
 
     diffusion = Diffusion(timesteps=1000, device=device)  # 传递设备
 
-    # model_path = "model_epoch_leaset.pth"  # 加载模型权重
-    # # 加载模型权重
-    # model.load_state_dict(torch.load(model_path, map_location=device))
-    # model.eval()
+    model_path = "model_epoch_leaset.pth"  # 加载模型权重
+    # 加载模型权重
+    model.load_state_dict(torch.load(model_path, map_location=device))
+    model.train()
 
     istrain = True
     if istrain:
-        train_model(model, diffusion, dataloader, device, epochs=100, lr=1e-4)
+        train_model(model, diffusion, dataloader, device, epochs=100, lr=1e-5)
     else:
         # 推理示例（从数据集中取一个样本）
         init_frame, future_frames = dataset[0]  # future_frames: (T, C, H, W)

@@ -24,5 +24,6 @@ if __name__ == "__main__":
 
     embedding = get_embedding(encoder, projection_head, image, device)
     print(f"Embedding for {image_path}: {embedding}")
-
+    print(f"Maximum value in embedding: {torch.max(torch.tensor(embedding))}")
+    print(f"Minimum value in embedding: {torch.min(torch.tensor(embedding))}")
 
