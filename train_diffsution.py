@@ -47,6 +47,7 @@ class GPT2Decoder(nn.Module):
         ])
 
     def forward(self, x):
+        
         for layer in self.layers:
             # Multihead self-attention
             attn_output, _ = layer["attn"](x, x, x)
@@ -59,7 +60,22 @@ class GPT2Decoder(nn.Module):
             x = layer["ln2"](x)
 
         return x
+    
 
+def normalize_tensor(tensor, mean, std):
+    """
+    对张量进行通道正则化。
+    Args:
+        tensor: 输入张量，形状为 (N, C, H, W)。
+        mean: 每个通道的均值，长度为 C。
+        std: 每个通道的标准差，长度为 C。
+    Returns:
+        正则化后的张量。
+    """
+    # 将 mean 和 std 调整为张量形状 (1, C, 1, 1)
+    mean = torch.tensor(mean, dtype=tensor.dtype, device=tensor.device).view(1, -1, 1, 1)
+    std = torch.tensor(std, dtype=tensor.dtype, device=tensor.device).view(1, -1, 1, 1)
+    return (tensor - mean) / (std + 1e-6)  # 避免除以 0
 
 ########################################
 # 数据集类（根据已分割好的数据）
@@ -75,7 +91,9 @@ class SegmentDataset(Dataset):
     def __getitem__(self, idx):
         segment_file = self.files[idx]
         data = np.load(segment_file, allow_pickle=True).item()
-        
+        mean = [0.485, 0.456, 0.406, 0.5]  # 根据需求调整
+        std = [0.229, 0.224, 0.225, 0.3]   # 根据需求调整
+
         initial_frame = data["initial_frame"]["img"]  # (H, W, C)
         future_frames = [f["img"] for f in data["future_frames"]]  # (T, H, W, C)
 
@@ -83,14 +101,24 @@ class SegmentDataset(Dataset):
         initial_frame = torch.from_numpy(initial_frame).permute(2, 1, 0).float()
 
         # 缩放到目标尺寸 (64, 36)
-        initial_frame = F.interpolate(initial_frame.unsqueeze(0), size=(36, 64), mode='bilinear', align_corners=False)
+        initial_frame = F.interpolate(initial_frame.unsqueeze(0), size=(64, 36), mode='bilinear', align_corners=False)
         initial_frame = initial_frame.squeeze(0)  # 去掉 batch 维度
+        initial_frame = normalize_tensor(initial_frame,mean=mean,std=std)
 
-        future_frames = np.stack(future_frames, axis=0)  # (T, H, W, C)
-        future_frames = torch.from_numpy(future_frames).permute(0, 3, 2, 1).float()  # (T, C, W, H)
-        future_frames = F.interpolate(future_frames, size=(36, 64), mode='bilinear', align_corners=False)
-        
-        return initial_frame, future_frames
+        new_future_frames = []
+        for future_frame in  future_frames:
+            x = torch.from_numpy(future_frame).permute(2, 1, 0).float()
+            new_future_frames.append(x)
+
+        new_future_frames = np.stack(new_future_frames, axis=0)  # (T, H, W, C)
+        new_future_frames = torch.from_numpy(new_future_frames)
+        new_future_frames = F.interpolate(new_future_frames, size=(64, 36), mode='bilinear', align_corners=False)
+        new_future_frames = normalize_tensor(new_future_frames,mean=mean,std=std)
+
+
+        initial_frame = initial_frame[:,:3, :, :]  # 保留前三个通道
+        new_future_frames = new_future_frames[:,:3,:,:]
+        return initial_frame, new_future_frames
 
 ########################################
 # 简化U-Net模型
@@ -185,12 +213,29 @@ class Diffusion:
         sqrt_one_minus_alphas_cumprod_t = (1 - self.alphas_cumprod[t]).sqrt().view(-1, 1, 1, 1)
         return sqrt_alphas_cumprod_t * x_start + sqrt_one_minus_alphas_cumprod_t * noise
     
-    def p_losses(self, model, x_start, cond, t, ref_future_frames,device="cpu", lambda_ssim=1.0):
-        noise = torch.randn_like(x_start).to(device)
+    def p_losses(self, model, y, cond, t, ref_future_frames=None,device="cpu", lambda_ssim=1.0):
+        # noise = torch.randn_like(x_start).to(device)
         # x_noisy = self.q_sample(x_start, t, noise=noise)
-        cond = cond[0]
-        noise_pred = model(cond)
-        loss_mse = ((x_start - noise_pred) ** 2).mean()
+        cond = cond.squeeze(dim=0)
+
+        embedding = get_embedding(encoder, projection_head, cond, device)
+        # print(f"Embedding for {image_path}: {embedding}")
+
+        # Transformer Decoder example
+        # query = torch.randn(1, 1, embed_dim).to(device)  # Example query
+        memory = torch.tensor(embedding).unsqueeze(1).to(device)  # Use embedding as memory
+
+        noise_pred = model(memory)
+
+        label = []
+
+        for y0 in y:
+            yembedding = get_embedding(encoder, projection_head, y0, device)
+            yembedding  = torch.tensor(yembedding).unsqueeze(1).to(device)
+            label.append(yembedding)
+
+        tensor_label = torch.stack(label)
+        loss_mse = ((tensor_label - noise_pred) ** 2).mean()
         
         # 计算SSIM损失
         #loss_ssim = 1 - ssim_metric(x0_pred, x_start, data_range=1.0, size_average=True)
@@ -244,18 +289,12 @@ def train_model(model, diffusion, dataloader, device, epochs=10, lr=1e-4):
     for epoch in range(epochs):
         pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs}")
         for batch_idx, (init_frame, future_frames) in enumerate(pbar):
-            B, T, C, H, W = future_frames.shape
-            # 归一化到 [0, 1] 范围
-            ref_future_frames = future_frames / 255.0
+            B, T, C, W, H = future_frames.shape
             # 使用 .reshape() 以避免视图错误
-            future_frames = future_frames.reshape(B, T , C, H, W).to(device)
+            future_frames = future_frames.reshape(B, T , C, W, H).to(device)
             init_frame = init_frame.to(device)
-
-            init_frame /= 255.0
-
             t = torch.randint(0, diffusion.timesteps, (B,), device=device).long()
-            loss = diffusion.p_losses(model, future_frames, init_frame, t, ref_future_frames, device=device, lambda_ssim=1.0)
-            
+            loss = diffusion.p_losses(model, future_frames, init_frame, t, device=device, lambda_ssim=1.0)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -272,7 +311,7 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     segment_dir = "data/split_segments"  # 已分割好的数据目录
     dataset = SegmentDataset(segment_dir)
-    dataloader = DataLoader(dataset, batch_size=2, shuffle=True)
+    dataloader = DataLoader(dataset, batch_size=1, shuffle=True)
     
     # 获取一个样本以确定 T 和 C
     sample_init_frame, sample_future_frames = dataset[0]  # future_frames: (T, C, H, W)
@@ -318,23 +357,6 @@ if __name__ == "__main__":
         plt.figure(figsize=(20, 5 * T))
         
         for sample_idx in range(num_samples):
-            # ssim_values = []
-            # for t in range(T):
-            #     # SSIM 计算
-            #     frame_gt = future_frames_np[t].transpose(1, 2, 0)  # (H, W, C)
-            #     frame_pred = predicted_frames_np[sample_idx, t].transpose(1, 2, 0)  # (H, W, C)
-                
-            #     # 转换为 torch 张量并添加批次维度
-            #     frame_gt_tensor = torch.from_numpy(frame_gt).permute(2, 0, 1).unsqueeze(0).to(device).float()
-            #     frame_pred_tensor = torch.from_numpy(frame_pred).permute(2, 0, 1).unsqueeze(0).to(device).float()
-                
-            #     # 计算 SSIM
-            #     ssim_val = ssim_metric(frame_pred_tensor, frame_gt_tensor, data_range=1.0, size_average=True)
-            #     ssim_values.append(ssim_val.item())
-            
-            # avg_ssim = np.mean(ssim_values)
-            # print(f"Average SSIM for Prediction {sample_idx+1}: {avg_ssim:.4f}")
-            
             # 可视化
             for t in range(T):
                 # Ground Truth Frame

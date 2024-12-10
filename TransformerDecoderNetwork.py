@@ -153,4 +153,4 @@ if __name__ == "__main__":
 
     decoder = GPT2Decoder(embed_dim=embed_dim, num_heads=num_heads, num_layers=num_layers, feedforward_dim=feedforward_dim).to(device)
     output = decoder(memory)
-    print(f"Transformer Decoder Output: {output}")
+    print(f"Transformer Decoder Output: {output}  shape:{output.shape}")
