@@ -15,6 +15,8 @@ from pathlib import Path
 from lightly.loss import NTXentLoss
 from embed.net_emded import ConvNet,SimCLRProjectionHead
 from model.Net import SimpleAttentionDecoder
+from model.loss import custom_loss
+
 # Data augmentation: Generate two different augmented views
 transform_simclr = transforms.Compose([
     transforms.Resize(size=(64, 36)),
@@ -111,7 +113,7 @@ if Training:
             loss_contrastive = criterion(zi, zj)
             
             # Reconstruction loss (Mean Squared Error)
-            loss_reconstruction = F.mse_loss(reconstructed_xi, xi) + F.mse_loss(reconstructed_xj, xj)
+            loss_reconstruction = custom_loss(reconstructed_xi, xi) + custom_loss(reconstructed_xj, xj)
 
             # Total loss
             loss =loss_contrastive +  1 * loss_reconstruction  # 加权以平衡两者   +  loss_contrastive +
