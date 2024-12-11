@@ -21,3 +21,7 @@ data/*
 data
 
 *.pth
+
+reconstructed_images
+
+future_frames

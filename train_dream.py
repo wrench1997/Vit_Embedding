@@ -10,7 +10,7 @@ import matplotlib.pyplot as plt  # Added for visualization
 from torchvision import transforms
 from embed.net_emded import load_embedding_model,prepare_transform,get_embedding
 import torch.nn.functional as F
-
+from model.Net import GPT2Decoder
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -27,67 +27,28 @@ encoder, projection_head = load_embedding_model(encoder_path, projection_head_pa
 
 
 
+def min_max_normalize(tensor):
+    min_val = tensor.min()
+    max_val = tensor.max()
+    return (tensor - min_val) / (max_val - min_val + 1e-8)  # 加一个小值避免除零
 
 
-class GPT2Decoder(nn.Module):
-    def __init__(self, embed_dim, num_heads, num_layers, feedforward_dim):
-        super(GPT2Decoder, self).__init__()
-        self.layers = nn.ModuleList([
-            nn.ModuleDict({
-                "attn": nn.MultiheadAttention(embed_dim, num_heads),
-                "ffn": nn.Sequential(
-                    nn.Linear(embed_dim, feedforward_dim),
-                    nn.ReLU(),
-                    nn.Linear(feedforward_dim, embed_dim)
-                ),
-                "ln1": nn.LayerNorm(embed_dim),
-                "ln2": nn.LayerNorm(embed_dim)
-            })
-            for _ in range(num_layers)
-        ])
-        self.map_layer = AttentionMapper(embed_dim=embed_dim, num_heads=num_heads).to(device)
-
-    def forward(self, x):
-        
-        for layer in self.layers:
-            # Multihead self-attention
-            attn_output, _ = layer["attn"](x, x, x)
-            x = x + attn_output
-            x = layer["ln1"](x)
-
-            # Feedforward network
-            ffn_output = layer["ffn"](x)
-            x = x + ffn_output
-            x = layer["ln2"](x)
-
-
-        # max_val = x.max()
-        # min_val = x.min()
-        # x = (attn_output - min_val) / (max_val - min_val) * (4 - (-3)) + (-3)
-
-        x = self.map_layer(x)
-
-
-        max_val = x.max()
-        min_val = x.min()
-        x = (attn_output - min_val) / (max_val - min_val) * (max_val - min_val) + min_val
-        return x
-    
-
-def normalize_tensor(tensor, mean, std):
+def normalize_tensor(tensor, min_val=0, max_val=1):
     """
-    对张量进行通道正则化。
+    对张量进行通道归一化，将每个通道的值缩放到 [0, 1] 范围内。
     Args:
         tensor: 输入张量，形状为 (N, C, H, W)。
-        mean: 每个通道的均值，长度为 C。
-        std: 每个通道的标准差，长度为 C。
+        min_val: 每个通道的最小值，长度为 C。
+        max_val: 每个通道的最大值，长度为 C。
     Returns:
-        正则化后的张量。
+        归一化后的张量。
     """
-    # 将 mean 和 std 调整为张量形状 (1, C, 1, 1)
-    mean = torch.tensor(mean, dtype=tensor.dtype, device=tensor.device).view(1, -1, 1, 1)
-    std = torch.tensor(std, dtype=tensor.dtype, device=tensor.device).view(1, -1, 1, 1)
-    return (tensor - mean) / (std + 1e-6)  # 避免除以 0
+    # 将 min_val 和 max_val 调整为张量形状 (1, C, 1, 1)
+    min_val = torch.tensor(min_val, dtype=tensor.dtype, device=tensor.device).view(1, -1, 1, 1)
+    max_val = torch.tensor(max_val, dtype=tensor.dtype, device=tensor.device).view(1, -1, 1, 1)
+
+    # 归一化计算，避免除以 0
+    return (tensor - min_val) / (max_val - min_val + 1e-6)
 
 ########################################
 # 数据集类（根据已分割好的数据）
@@ -103,8 +64,6 @@ class SegmentDataset(Dataset):
     def __getitem__(self, idx):
         segment_file = self.files[idx]
         data = np.load(segment_file, allow_pickle=True).item()
-        mean = [0.485, 0.456, 0.406, 0.5]  # 根据需求调整
-        std = [0.229, 0.224, 0.225, 0.3]   # 根据需求调整
 
         initial_frame = data["initial_frame"]["img"]  # (H, W, C)
         future_frames = [f["img"] for f in data["future_frames"]]  # (T, H, W, C)
@@ -115,22 +74,36 @@ class SegmentDataset(Dataset):
         # 缩放到目标尺寸 (64, 36)
         initial_frame = F.interpolate(initial_frame.unsqueeze(0), size=(64, 36), mode='bilinear', align_corners=False)
         initial_frame = initial_frame.squeeze(0)  # 去掉 batch 维度
-        initial_frame = normalize_tensor(initial_frame,mean=mean,std=std)
+        initial_frame = normalize_tensor(initial_frame)
 
         new_future_frames = []
         for future_frame in  future_frames:
-            x = torch.from_numpy(future_frame).permute(2, 1, 0).float()
+            x = torch.from_numpy(future_frame).permute(1, 2, 0).float()
             new_future_frames.append(x)
 
         new_future_frames = np.stack(new_future_frames, axis=0)  # (T, H, W, C)
         new_future_frames = torch.from_numpy(new_future_frames)
         new_future_frames = F.interpolate(new_future_frames, size=(64, 36), mode='bilinear', align_corners=False)
-        new_future_frames = normalize_tensor(new_future_frames,mean=mean,std=std)
+        new_future_frames = normalize_tensor(new_future_frames)
 
 
         initial_frame = initial_frame[:,:3, :, :]  # 保留前三个通道
         new_future_frames = new_future_frames[:,:3,:,:]
         return initial_frame, new_future_frames
+
+
+
+class MinMaxNorm(nn.Module):
+    def __init__(self, dim, eps=1e-6):
+        super(MinMaxNorm, self).__init__()
+        self.eps = eps
+
+    def forward(self, x):
+        min_val = x.min(dim=-1, keepdim=True).values
+        max_val = x.max(dim=-1, keepdim=True).values
+        return (x - min_val) / (max_val - min_val + self.eps)
+
+
 
 ########################################
 # 简化U-Net模型
@@ -178,8 +151,8 @@ class AttentionMapper(nn.Module):
         # 通过多头注意力机制
         attn_output, _ = self.multihead_attn(query, key, value)  # attn_output shape: (1, batch_size, embed_dim)
 
-        # Layer normalization
-        attn_output = self.layer_norm(attn_output)
+        # # Layer normalization
+        # attn_output = self.layer_norm(attn_output)
 
         # Adjust shape to (num_queries, 1, 1, embed_dim)
         attn_output = attn_output.permute(1, 0, 2).unsqueeze(2).expand(batch_size, self.num_queries, 1, self.embed_dim)
@@ -275,6 +248,9 @@ class Diffusion:
         # query = torch.randn(1, 1, embed_dim).to(device)  # Example query
         memory = torch.tensor(embedding).unsqueeze(1).to(device)  # Use embedding as memory
 
+
+
+
         noise_pred = model(memory)
 
         label = []
@@ -285,7 +261,13 @@ class Diffusion:
             label.append(yembedding)
 
         tensor_label = torch.stack(label)
-        loss_mse = ((tensor_label - noise_pred) ** 2).mean()
+
+
+        # 归一化 tensor_label 和 noise_pred
+        normalized_label = min_max_normalize(tensor_label)
+        normalized_pred = min_max_normalize(noise_pred)
+
+        loss_mse = ((normalized_label - normalized_pred) ** 2).mean()
         
         # 计算SSIM损失
         #loss_ssim = 1 - ssim_metric(x0_pred, x_start, data_range=1.0, size_average=True)
@@ -335,24 +317,53 @@ def sample(model, diffusion, init_frame, device, num_future=8, C=4, H=360, W=640
 ########################################
 def train_model(model, diffusion, dataloader, device, epochs=10, lr=1e-5):
     optimizer = optim.SGD(model.parameters(), lr=lr)
+    model.to(device)
     model.train()
+    
+    best_loss = float('inf')  # 初始化最佳损失为正无穷
+    
     for epoch in range(epochs):
         pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs}")
+        epoch_loss = 0.0  # 用于累积 epoch 中的损失
+        num_batches = 0   # 统计批次数量
+        
         for batch_idx, (init_frame, future_frames) in enumerate(pbar):
             B, T, C, W, H = future_frames.shape
             # 使用 .reshape() 以避免视图错误
-            future_frames = future_frames.reshape(B, T , C, W, H).to(device)
+            future_frames = future_frames.reshape(B, T, C, W, H).to(device)
             init_frame = init_frame.to(device)
+            
+            # 随机生成时间步长 t
             t = torch.randint(0, diffusion.timesteps, (B,), device=device).long()
+            
+            # 计算损失
             loss = diffusion.p_losses(model, future_frames, init_frame, t, device=device, lambda_ssim=1.0)
+            
+            # 反向传播和优化
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            
+            # 累积损失
+            epoch_loss += loss.item()
+            num_batches += 1
+            
+            # 更新进度条显示当前批次的损失
             pbar.set_postfix({"loss": loss.item()})
+        
+        # 计算当前 epoch 的平均损失
+        avg_loss = epoch_loss / num_batches
+        print(f"Epoch {epoch+1}/{epochs} - Average Loss: {avg_loss:.6f}")
+        
+        # 如果当前平均损失是最低的，则保存模型
+        if avg_loss < best_loss:
+            best_loss = avg_loss
+            torch.save(model.state_dict(), "best_model.pth")
+            print(f"→ 保存最佳模型 (Epoch {epoch+1})，损失降低到 {best_loss:.6f}")
+        else:
+            print(f"→ 当前损失未降低 (Best Loss: {best_loss:.6f})")
     
-        # 可选：保存模型
-        torch.save(model.state_dict(), f"model_epoch_leaset.pth")
-
+    print("训练完成！")
 ########################################
 # 主函数示例：训练 + 推理 + 计算SSIM + 显示图片
 ########################################
@@ -378,7 +389,7 @@ if __name__ == "__main__":
 
     diffusion = Diffusion(timesteps=1000, device=device)  # 传递设备
 
-    model_path = "model_epoch_leaset.pth"  # 加载模型权重
+    model_path = "best_model.pth"  # 加载模型权重
     # 加载模型权重
     # 检查文件是否存在
     if os.path.exists(model_path):

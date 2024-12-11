@@ -14,20 +14,22 @@ import torch.nn.functional as F
 
 
 
-def normalize_tensor(tensor, mean, std):
+def normalize_tensor(tensor, min_val=0, max_val=1):
     """
-    对张量进行通道正则化。
+    对张量进行通道归一化，将每个通道的值缩放到 [0, 1] 范围内。
     Args:
         tensor: 输入张量，形状为 (N, C, H, W)。
-        mean: 每个通道的均值，长度为 C。
-        std: 每个通道的标准差，长度为 C。
+        min_val: 每个通道的最小值，长度为 C。
+        max_val: 每个通道的最大值，长度为 C。
     Returns:
-        正则化后的张量。
+        归一化后的张量。
     """
-    # 将 mean 和 std 调整为张量形状 (1, C, 1, 1)
-    mean = torch.tensor(mean, dtype=tensor.dtype, device=tensor.device).view(1, -1, 1, 1)
-    std = torch.tensor(std, dtype=tensor.dtype, device=tensor.device).view(1, -1, 1, 1)
-    return (tensor - mean) / (std + 1e-6)  # 避免除以 0
+    # 将 min_val 和 max_val 调整为张量形状 (1, C, 1, 1)
+    min_val = torch.tensor(min_val, dtype=tensor.dtype, device=tensor.device).view(1, -1, 1, 1)
+    max_val = torch.tensor(max_val, dtype=tensor.dtype, device=tensor.device).view(1, -1, 1, 1)
+
+    # 归一化计算，避免除以 0
+    return (tensor - min_val) / (max_val - min_val + 1e-6)
 
 
 class SegmentDataset(Dataset):
@@ -53,7 +55,7 @@ class SegmentDataset(Dataset):
         # 缩放到目标尺寸 (64, 36)
         initial_frame = F.interpolate(initial_frame.unsqueeze(0), size=(64, 36), mode='bilinear', align_corners=False)
         initial_frame = initial_frame.squeeze(0)  # 去掉 batch 维度
-        initial_frame = normalize_tensor(initial_frame,mean=mean,std=std)
+        initial_frame = normalize_tensor(initial_frame)
 
         new_future_frames = []
         for future_frame in  future_frames:
@@ -63,7 +65,7 @@ class SegmentDataset(Dataset):
         new_future_frames = np.stack(new_future_frames, axis=0)  # (T, H, W, C)
         new_future_frames = torch.from_numpy(new_future_frames)
         new_future_frames = F.interpolate(new_future_frames, size=(64, 36), mode='bilinear', align_corners=False)
-        new_future_frames = normalize_tensor(new_future_frames,mean=mean,std=std)
+        new_future_frames = normalize_tensor(new_future_frames)
 
 
         initial_frame = initial_frame[:,:3, :, :]  # 保留前三个通道

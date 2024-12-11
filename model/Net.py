@@ -17,12 +17,32 @@ import math
 
 
 
+# 定义 AttentionMapper 类
+class AttentionMapper(nn.Module):
+    def __init__(self, embed_dim, num_heads, output_size=8):
+        super(AttentionMapper, self).__init__()
+        self.output_size = output_size
+        self.attn = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)
+        self.linear = nn.Linear(embed_dim, embed_dim * output_size)
+    
+    def forward(self, x):
+        # x 的形状: (batch_size, seq_length, embed_dim)
+        attn_output, _ = self.attn(x, x, x)  # (batch_size, seq_length, embed_dim)
+        # 通过线性层扩展维度
+        mapped = self.linear(attn_output)  # (batch_size, seq_length, embed_dim * output_size)
+        # 重塑为 (output_size, batch_size, seq_length, embed_dim)
+        mapped = mapped.view(x.size(0), x.size(1), self.output_size, -1)  # (batch_size, seq_length, output_size, embed_dim)
+        # 交换维度以符合目标形状 (output_size, batch_size, seq_length, embed_dim)
+        mapped = mapped.permute(2, 0, 1, 3)  # (output_size, batch_size, seq_length, embed_dim)
+        return mapped
+
+# 定义 GPT2Decoder 类
 class GPT2Decoder(nn.Module):
-    def __init__(self, embed_dim, num_heads, num_layers, feedforward_dim,device='cpu'):
+    def __init__(self, embed_dim, num_heads, num_layers, feedforward_dim, device='cpu'):
         super(GPT2Decoder, self).__init__()
         self.layers = nn.ModuleList([
             nn.ModuleDict({
-                "attn": nn.MultiheadAttention(embed_dim, num_heads),
+                "attn": nn.MultiheadAttention(embed_dim, num_heads, batch_first=True),
                 "ffn": nn.Sequential(
                     nn.Linear(embed_dim, feedforward_dim),
                     nn.ReLU(),
@@ -33,72 +53,31 @@ class GPT2Decoder(nn.Module):
             })
             for _ in range(num_layers)
         ])
-        self.map_layer = AttentionMapper(embed_dim=embed_dim, num_heads=num_heads).to(device)
-
+        self.map_layer = AttentionMapper(embed_dim=embed_dim, num_heads=num_heads, output_size=8).to(device)
+    
     def forward(self, x):
-        
+        # x 的形状: (batch_size, seq_length, embed_dim)
         for layer in self.layers:
-            # Multihead self-attention
-            attn_output, _ = layer["attn"](x, x, x)
+            # 多头自注意力
+            attn_output, _ = layer["attn"](x, x, x)  # (batch_size, seq_length, embed_dim)
             x = x + attn_output
             x = layer["ln1"](x)
 
-            # Feedforward network
-            ffn_output = layer["ffn"](x)
+            # 前馈网络
+            ffn_output = layer["ffn"](x)  # (batch_size, seq_length, embed_dim)
             x = x + ffn_output
             x = layer["ln2"](x)
+        
+        x = self.map_layer(x)  # (output_size, batch_size, seq_length, embed_dim)
 
+        # 进行归一化
+        # 计算每个 output_size 的最大值和最小值
+        # max_val = x.max(dim=-1, keepdim=True)  # (output_size, batch_size, seq_length, 1)
+        # min_val = x.min(dim=-1, keepdim=True)  # (output_size, batch_size, seq_length, 1)
+        # x = (x - min_val) / (max_val - min_val + 1e-8)  # 防止除以零
+        # x = x * (max_val - min_val) + min_val  # 恢复到原始范围
 
-        # max_val = x.max()
-        # min_val = x.min()
-        # x = (attn_output - min_val) / (max_val - min_val) * (4 - (-3)) + (-3)
-
-        x = self.map_layer(x)
-
-
-        max_val = x.max()
-        min_val = x.min()
-        x = (attn_output - min_val) / (max_val - min_val) * (max_val - min_val) + min_val
-        return x
-
-
-
-class AttentionMapper(nn.Module):
-    def __init__(self, embed_dim, num_heads, num_queries=8):
-        super(AttentionMapper, self).__init__()
-        self.num_queries = num_queries
-        self.embed_dim = embed_dim
-
-        # 自定义的 KQV 权重
-        self.key_layer = nn.Linear(embed_dim, embed_dim)
-        self.query_layer = nn.Linear(embed_dim, embed_dim)
-        self.value_layer = nn.Linear(embed_dim, embed_dim)
-
-        # 多头注意力机制
-        self.multihead_attn = nn.MultiheadAttention(embed_dim=embed_dim, num_heads=num_heads)
-
-        # Layer normalization
-        self.layer_norm = nn.LayerNorm(embed_dim)
-
-    def forward(self, x):
-        # x: 输入 (batch_size, 1, embed_dim)
-        batch_size = x.size(0)
-
-        # 提取查询、键和值
-        query = self.query_layer(x).permute(1, 0, 2)  # (batch_size, 1, embed_dim) -> (1, batch_size, embed_dim)
-        key = self.key_layer(x).permute(1, 0, 2)  # (batch_size, 1, embed_dim) -> (1, batch_size, embed_dim)
-        value = self.value_layer(x).permute(1, 0, 2)  # (batch_size, 1, embed_dim) -> (1, batch_size, embed_dim)
-
-        # 通过多头注意力机制
-        attn_output, _ = self.multihead_attn(query, key, value)  # attn_output shape: (1, batch_size, embed_dim)
-
-        # Layer normalization
-        attn_output = self.layer_norm(attn_output)
-
-        # Adjust shape to (num_queries, 1, 1, embed_dim)
-        attn_output = attn_output.permute(1, 0, 2).unsqueeze(2).expand(batch_size, self.num_queries, 1, self.embed_dim)
-        attn_output = attn_output.permute(1, 0, 2,3)
-        return attn_output
+        return x  # (output_size, batch_size, seq_length, embed_dim)
 
 
 
@@ -204,3 +183,57 @@ class CompressionNet(nn.Module):
 #         input_tensor = torch.randn(batch_size, 1, 1, 1024)
 #         output = model(input_tensor)
 #         print(f"输入形状: {input_tensor.shape} -> 输出形状: {output.shape}")
+
+
+
+
+
+
+
+class SimpleAttentionDecoder(nn.Module):
+    def __init__(self, embed_dim=128, output_channels=3, input_shape=(64, 36)):
+        super(SimpleAttentionDecoder, self).__init__()
+
+        # Embedding dimension
+        self.embed_dim = embed_dim
+
+        # Simple self-attention mechanism
+        self.attention = nn.MultiheadAttention(embed_dim=embed_dim, num_heads=4, dropout=0.1)
+
+        # A small feedforward network for additional transformations
+        self.ffn = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim * 2),
+            nn.ReLU(),
+            nn.Linear(embed_dim * 2, embed_dim)
+        )
+
+        # Convolutional layer to reshape the output of the attention
+        self.fc = nn.Linear(embed_dim, 128 * 64 * 36)  # Flattened image size
+        self.reshape = nn.Unflatten(1, (128, 64, 36))  # Reshape back to image format
+
+        # Final convolutional layer with output channels
+        self.final_conv = nn.Conv2d(128, output_channels, kernel_size=1, stride=1)
+
+        self.sigmoid = nn.Sigmoid()
+
+        # # Tanh activation to ensure output is in the correct range
+        # self.tanh = nn.Tanh()
+
+    def forward(self, z):
+        # Assume z is of shape (batch_size, embed_dim)
+        z = z.unsqueeze(0)  # Add the sequence dimension (1)
+
+        # Self-attention (assuming memory = input for simplicity)
+        attn_output, _ = self.attention(z, z, z)
+
+        # Feedforward network to process the attention output
+        output = self.ffn(attn_output.squeeze(0))  # Remove the sequence dimension
+        output = self.fc(output)  # Project to flattened image size
+        output = self.reshape(output)  # Reshape to image size [batch_size, 128, 64, 36]
+
+        # Final output image (with the correct number of channels)
+        output = self.final_conv(output)
+
+
+        output = self.sigmoid(output)
+        return output

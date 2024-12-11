@@ -14,13 +14,13 @@ class ConvBlock(nn.Module):
         super(ConvBlock, self).__init__()
         self.conv = nn.Conv2d(n_in, n_out, kernel_size=kernel_size, stride=1, padding=kernel_size // 2)
         self.bn = nn.BatchNorm2d(n_out)
-        self.dropout = nn.Dropout2d(dropout_rate)
+        # self.dropout = nn.Dropout2d(dropout_rate)
         self.relu = nn.ReLU(inplace=True)
 
     def forward(self, x):
         x = self.conv(x)
         x = self.bn(x)
-        x = self.dropout(x)
+        # x = self.dropout(x)
         x = self.relu(x)
         return x
 
@@ -29,13 +29,13 @@ class FullyConnectedBlock(nn.Module):
         super(FullyConnectedBlock, self).__init__()
         self.fc = nn.Linear(n_in, n_out)
         self.bn = nn.BatchNorm1d(n_out)
-        self.dropout = nn.Dropout(dropout_rate)
+        # self.dropout = nn.Dropout(dropout_rate)
         self.relu = nn.ReLU(inplace=True)
 
     def forward(self, x):
         x = self.fc(x)
         x = self.bn(x)
-        x = self.dropout(x)
+        # x = self.dropout(x)
         x = self.relu(x)
         return x
 
