@@ -12,6 +12,7 @@ import matplotlib.pyplot as plt  # Added for visualization
 from torchvision import transforms
 from embed.net_emded import load_embedding_model,prepare_transform,get_embedding
 import torch.nn.functional as F
+import math
 
 
 
@@ -98,3 +99,62 @@ class AttentionMapper(nn.Module):
         attn_output = attn_output.permute(1, 0, 2).unsqueeze(2).expand(batch_size, self.num_queries, 1, self.embed_dim)
         attn_output = attn_output.permute(1, 0, 2,3)
         return attn_output
+
+
+
+
+
+
+class AttentionWithLlamaRotaryEncoding(nn.Module):
+    def __init__(self, dim, num_heads):
+        super(AttentionWithLlamaRotaryEncoding, self).__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        assert self.head_dim * num_heads == dim, "dim must be divisible by num_heads"
+
+        self.qkv = nn.Linear(dim, 3 * dim, bias=False)
+        self.fc_out = nn.Linear(dim, dim)
+
+    def llama_rotary_embedding(self, seq_len, dim):
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
+        t = torch.arange(seq_len, dtype=torch.float)
+        freqs = torch.outer(t, inv_freq)
+        
+        cos_emb = torch.cos(freqs)
+        sin_emb = torch.sin(freqs)
+        return cos_emb, sin_emb
+
+    def apply_llama_rotary_embedding(self, x, cos_emb, sin_emb):
+        x1, x2 = x[..., 0::2], x[..., 1::2]
+        x_rotated = torch.cat((x1 * cos_emb - x2 * sin_emb, x1 * sin_emb + x2 * cos_emb), dim=-1)
+        return x_rotated
+
+    def forward(self, x):
+        batch_size, seq_len, _ = x.size()
+        qkv = self.qkv(x).chunk(3, dim=-1)
+        q, k, v = map(
+            lambda t: t.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2), qkv
+        )
+
+        cos_emb, sin_emb = self.llama_rotary_embedding(seq_len, self.head_dim)
+        cos_emb, sin_emb = cos_emb.to(x.device), sin_emb.to(x.device)
+
+        q = self.apply_llama_rotary_embedding(q, cos_emb, sin_emb)
+        k = self.apply_llama_rotary_embedding(k, cos_emb, sin_emb)
+
+        attn_scores = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(self.head_dim)
+        attn_weights = torch.nn.functional.softmax(attn_scores, dim=-1)
+        
+        attn_output = torch.matmul(attn_weights, v)
+        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.dim)
+        
+        return self.fc_out(attn_output)
+
+# # Usage example
+# batch_size, seq_len, dim, num_heads = 32, 128, 512, 8
+# x = torch.randn(batch_size, seq_len, dim)
+# attention_module = AttentionWithLlamaRotaryEncoding(dim, num_heads)
+# out = attention_module(x)
+# print(out.shape)  # Expected output: torch.Size([32, 128, 512])
+
