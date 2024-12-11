@@ -387,7 +387,7 @@ if __name__ == "__main__":
                         num_layers=num_layers,
                         feedforward_dim=feedforward_dim).to(device=device)
 
-    diffusion = Diffusion(timesteps=1000, device=device)  # 传递设备
+    diffusion = Diffusion(timesteps=2000, device=device)  # 传递设备
 
     model_path = "best_model.pth"  # 加载模型权重
     # 加载模型权重
