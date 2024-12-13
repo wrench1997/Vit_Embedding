@@ -2,6 +2,9 @@ from skimage.metrics import structural_similarity as ssim
 import numpy as np
 import torch
 
+
+import torch.fft
+
 def calculate_ssim(img1, img2):
     """
     计算两张图像的结构相似性指数 (SSIM)
@@ -38,6 +41,14 @@ def gradient_loss(x, y):
     return grad_loss
 
 
+def frequency_loss(x, y):
+    x_freq = torch.fft.fft2(x)  # 计算傅里叶变换
+    y_freq = torch.fft.fft2(y)
+    
+    # 计算高频区域的差异
+    freq_loss = torch.mean(torch.abs(x_freq - y_freq))
+    return freq_loss
+
 def total_variation_loss(x):
     dx = x[:, :, 1:, :] - x[:, :, :-1, :]
     dy = x[:, :, :, 1:] - x[:, :, :, :-1]
@@ -53,7 +64,9 @@ def custom_loss(x, y):
     
     # 总变差损失
     tv_loss = total_variation_loss(y)
+
+    fft = frequency_loss(x,y)
     
     # 组合损失
-    total_loss = mse_loss + 0.9 * grad_loss_value + 0.01 * tv_loss
+    total_loss = mse_loss + 0.9 * grad_loss_value + 0.001 * tv_loss + fft
     return total_loss

@@ -85,7 +85,7 @@ Training = False
 if Training:
 
     # Training loop with reconstruction loss
-    num_epochs = 200
+    num_epochs = 300
     steps, losses = [], []
     min_loss = float('inf')  # Initialize min_loss to a very high value
 
