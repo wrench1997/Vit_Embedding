@@ -6,7 +6,7 @@ import numpy as np
 import os
 # ====== 从 diffusers 导入 DDPMScheduler, UNet2DModel ======
 from diffusers import DDPMScheduler, UNet2DModel
-
+from tqdm import tqdm  # 导入 tqdm 库
 # =================================================================
 # 1) 替换自定义生成器为一个简单包装的 DiffusionModel(UNet2DModel)
 # =================================================================
@@ -107,7 +107,7 @@ def main():
     h, w, c = 64, 64, 3
     seq = 7
     noise_dim = 1024
-    num_epochs = 5
+    num_epochs = 100
     batch_size = 1
     lambda_diversity = 0.1
     lr = 1e-4
@@ -136,34 +136,48 @@ def main():
         print(f"加载已有权重，从 Epoch {start_epoch} 继续训练。")
 
     # ============ 训练循环 ============
+
+
+    # 在训练循环中添加 tqdm 进度条
     for epoch in range(start_epoch, num_epochs):
         model.train()
         running_loss = 0.0
+        
+        # 用 tqdm 包裹 dataloader，显示训练进度
+        with tqdm(enumerate(dataloader), total=len(dataloader), desc=f"Epoch {epoch+1}/{num_epochs}", ncols=100) as pbar:
+            for batch_idx, (target_video, input_tensor) in pbar:
+                input_tensor = input_tensor.to(device)      # (b, h, w, c)
+                target_video = target_video.to(device)      # (b, seq, h, w, c)
 
-        for batch_idx, (target_video, input_tensor) in enumerate(dataloader):
-            input_tensor = input_tensor.to(device)      # (b, h, w, c)
-            target_video = target_video.to(device)      # (b, seq, h, w, c)
+                optimizer.zero_grad()
 
-            optimizer.zero_grad()
+                # 前向传播
+                video1, video2 = model(input_tensor)
 
-            video1, video2 = model(input_tensor)
+                # 计算损失
+                loss1 = reconstruction_loss_fn(video1, target_video)
+                loss2 = reconstruction_loss_fn(video2, target_video)
+                reconstruction_loss = loss1 + loss2
 
-            loss1 = reconstruction_loss_fn(video1, target_video)
-            loss2 = reconstruction_loss_fn(video2, target_video)
-            reconstruction_loss = loss1 + loss2
+                diversity_loss = diversity_loss_fn(video1, video2)
+                total_loss = reconstruction_loss - lambda_diversity * diversity_loss
 
-            diversity_loss = diversity_loss_fn(video1, video2)
-            total_loss = reconstruction_loss - lambda_diversity * diversity_loss
+                # 反向传播和优化
+                total_loss.backward()
+                optimizer.step()
 
-            total_loss.backward()
-            optimizer.step()
+                running_loss += total_loss.item()
 
-            running_loss += total_loss.item()
+                # 更新进度条信息
+                pbar.set_postfix({
+                    "Batch Loss": total_loss.item(),
+                    "Avg Loss": running_loss / (batch_idx + 1)
+                })
 
         avg_loss = running_loss / len(dataloader)
         print(f"Epoch [{epoch+1}/{num_epochs}] Loss: {avg_loss:.4f}")
 
-        # ============ 每个 epoch 结束后保存一次 ============ 
+        # 保存模型权重和优化器状态
         torch.save({
             "epoch": epoch,
             "model_state_dict": model.state_dict(),
