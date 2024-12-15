@@ -27,6 +27,17 @@ encoder, projection_head = load_embedding_model(encoder_path, projection_head_pa
 
 
 
+# 定义损失函数和优化器
+reconstruction_loss_fn = nn.MSELoss()
+diversity_loss_fn = nn.L1Loss()  # 可以使用 L1 损失或其他适合的损失
+
+
+
+
+
+
+
+
 def min_max_normalize(tensor):
     min_val = tensor.min()
     max_val = tensor.max()
@@ -212,6 +223,8 @@ def linear_beta_schedule(timesteps, start=1e-4, end=0.02):
     return torch.linspace(start, end, timesteps)
 
 
+lambda_diversity = 0.1  # 权衡重建损失和多样性损失
+
 
 normalize_transform = transforms.Normalize(mean=[0.5,0.485, 0.456, 0.406], std=[0.5,0.229, 0.224, 0.225])
 
@@ -236,22 +249,30 @@ class Diffusion:
         sqrt_one_minus_alphas_cumprod_t = (1 - self.alphas_cumprod[t]).sqrt().view(-1, 1, 1, 1)
         return sqrt_alphas_cumprod_t * x_start + sqrt_one_minus_alphas_cumprod_t * noise
     
-    def p_losses(self, model, y, cond, t, ref_future_frames=None,device="cpu", lambda_ssim=1.0):
+    def p_losses(self, model, y, x, t, ref_future_frames=None,device="cpu", lambda_ssim=1.0):
         # noise = torch.randn_like(x_start).to(device)
         # x_noisy = self.q_sample(x_start, t, noise=noise)
-        cond = cond.squeeze(dim=0)
+        x = x.squeeze(dim=0)
 
-        embedding = get_embedding(encoder, projection_head, cond, device)
+        embedding = get_embedding(encoder, projection_head, x, device)
         # print(f"Embedding for {image_path}: {embedding}")
 
         # Transformer Decoder example
         # query = torch.randn(1, 1, embed_dim).to(device)  # Example query
         memory = torch.tensor(embedding).unsqueeze(1).to(device)  # Use embedding as memory
 
+        noise1 = torch.randn(1, self.noise_dim).to(x.device)
+        noise2 = torch.randn(1, self.noise_dim).to(x.device)
+
+        # 融合输入和噪声
+        combined1 = torch.cat([memory, noise1], dim=1)
+        combined2 = torch.cat([memory, noise2], dim=1)
 
 
+        noise_pred1 = model(combined1)
+        noise_pred2 = model(combined2)
 
-        noise_pred = model(memory)
+        
 
         label = []
 
@@ -265,16 +286,21 @@ class Diffusion:
 
         # 归一化 tensor_label 和 noise_pred
         normalized_label = min_max_normalize(tensor_label)
-        normalized_pred = min_max_normalize(noise_pred)
+        normalized_pred1 = min_max_normalize(noise_pred1)
+        normalized_pred2 = min_max_normalize(noise_pred2)
 
-        loss_mse = ((normalized_label - normalized_pred) ** 2).mean()
-        
-        # 计算SSIM损失
-        #loss_ssim = 1 - ssim_metric(x0_pred, x_start, data_range=1.0, size_average=True)
-        
-        # 结合MSE和SSIM损失
-        loss = loss_mse # + lambda_ssim * loss_ssim
-        return loss
+        # 计算重建损失
+        loss1 = reconstruction_loss_fn(normalized_pred1, normalized_label)
+        loss2 = reconstruction_loss_fn(normalized_pred2, normalized_label)
+        reconstruction_loss = loss1 + loss2
+
+        # 计算多样性损失
+        diversity_loss = diversity_loss_fn(normalized_pred1, normalized_pred2)
+
+        # 总损失
+        total_loss = reconstruction_loss - lambda_diversity * diversity_loss
+
+        return total_loss
 
 ########################################
 # 推理（采样）函数
