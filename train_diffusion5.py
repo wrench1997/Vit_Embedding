@@ -10,8 +10,12 @@ from tqdm import tqdm  # 导入 tqdm 库
 # =================================================================
 # 1) 替换自定义生成器为一个简单包装的 DiffusionModel(UNet2DModel)
 # =================================================================
+import torch
+import torch.nn as nn
+from diffusers import UNet2DModel, DDPMScheduler
+
 class DiffusionModel(nn.Module):
-    def __init__(self, h=16, w=16, c=64, seq=8, noise_dim=100):
+    def __init__(self, h=64, w=64, c=3, seq=8, noise_dim=100):
         super().__init__()
         self.h = h
         self.w = w
@@ -19,10 +23,11 @@ class DiffusionModel(nn.Module):
         self.seq = seq
         self.noise_dim = noise_dim
 
+        # UNet model
         self.unet = UNet2DModel(
-            sample_size=max(h, w),
-            in_channels=c,
-            out_channels=c,
+            sample_size=max(h,w),
+            in_channels=c,  # Should match the channels of input x
+            out_channels=c,  # Should match the channels of output
             down_block_types=(
                 "DownBlock2D",
                 "AttnDownBlock2D",
@@ -33,46 +38,44 @@ class DiffusionModel(nn.Module):
             layers_per_block=2
         )
 
-        input_dim = h*w*c + noise_dim
-        self.fc = nn.Linear(input_dim, h*w*c)
+        input_dim = h * w * c
+        self.fc = nn.Linear(input_dim, h * w * c)
 
         self.scheduler = DDPMScheduler(num_train_timesteps=1000, beta_start=0.0001, beta_end=0.02)
 
     def forward(self, x):
         """
-        x: (batch_size, h, w, c)
-        输出: video1, video2 -> (batch_size, seq, h, w, c)
+        x: (batch_size, w, h, c)
+        输出: video1, video2 -> (batch_size, seq, w, h, c)
         """
-        b = x.size(0)
-        # (b, h, w, c) --> (b, h*w*c)
-        x_flat = x.view(b, -1)
+        # Ensure input tensor has the right shape (batch_size, c, h, w)
+        batch_size = x.shape[0]
 
-        # 生成两份噪声向量
-        noise1 = torch.randn(b, self.noise_dim, device=x.device)
-        noise2 = torch.randn(b, self.noise_dim, device=x.device)
+        if x.shape[1] != self.c:
+            raise ValueError(f"Expected input with {self.c} channels, but got {x.shape[1]} channels.")
 
-        # 拼接后分别过一层线性
-        feat1 = self.fc(torch.cat([x_flat, noise1], dim=1))  # (b, h*w*c)
-        feat2 = self.fc(torch.cat([x_flat, noise2], dim=1))
+        # Add noise to the input at different timesteps
+        noise1 = torch.randn_like(x)
+        noise2 = torch.randn_like(x)
+        timesteps1 = torch.randint(0, 999, (batch_size,)).long().to(x.device)
+        timesteps2 = torch.randint(0, 999, (batch_size,)).long().to(x.device)
+        noisy_x1 = self.scheduler.add_noise(x, noise1, timesteps1)
+        noisy_x2 = self.scheduler.add_noise(x, noise2, timesteps2)
 
-        # reshape 成 (b, c, h, w)
-        feat1_4d = feat1.view(b, self.c, self.h, self.w)
-        feat2_4d = feat2.view(b, self.c, self.h, self.w)
+        # Pass noisy inputs through UNet
+        out1 = self.unet(noisy_x1, timesteps1).sample  # (b, c, h, w)
+        out2 = self.unet(noisy_x2, timesteps2).sample  # (b, c, h, w)
 
-        # 假装跑一次 unet
-        t = torch.randint(0, self.scheduler.num_train_timesteps, (b,), device=x.device)
-        out1 = self.unet(feat1_4d, t).sample  # (b, c, h, w)
-        out2 = self.unet(feat2_4d, t).sample  # (b, c, h, w)
+        # Replicate the output to generate the video sequence
+        out1_seq = out1.unsqueeze(1).repeat(1, self.seq, 1, 1, 1)  # (b, seq, c, h, w)
+        out2_seq = out2.unsqueeze(1).repeat(1, self.seq, 1, 1, 1)  # (b, seq, c, h, w)
 
-        # 复制 seq 次，得到 (b, seq, c, h, w)
-        out1_seq = out1.unsqueeze(1).repeat(1, self.seq, 1, 1, 1)
-        out2_seq = out2.unsqueeze(1).repeat(1, self.seq, 1, 1, 1)
-
-        # permute成 (b, seq, h, w, c)
+        # Permute to (b, seq, h, w, c)
         video1 = out1_seq.permute(0, 1, 3, 4, 2)
         video2 = out2_seq.permute(0, 1, 3, 4, 2)
 
         return video1, video2
+
 
 
 class DiffusionDataset(Dataset):
@@ -107,7 +110,7 @@ def main():
     h, w, c = 64, 64, 3
     seq = 7
     noise_dim = 1024
-    num_epochs = 100
+    num_epochs = 200
     batch_size = 1
     lambda_diversity = 0.1
     lr = 1e-4
@@ -150,7 +153,7 @@ def main():
                 target_video = target_video.to(device)      # (b, seq, h, w, c)
 
                 optimizer.zero_grad()
-
+                input_tensor = input_tensor.permute(0, 3, 2, 1)  # (b, c , w, h)
                 # 前向传播
                 video1, video2 = model(input_tensor)
 
