@@ -87,14 +87,27 @@ class DiffusionModelInfer:
         self.num_train_timesteps = 1000
 
     def generate(self, input_tensor):
-        b = input_tensor.size(0)
+        # b = input_tensor.size(0)
 
-        # Flatten input
-        input_flat = input_tensor.view(b, -1)
-        noise = torch.randn(b, self.noise_dim)
-        with torch.no_grad():
-            prediction = self.model(input_tensor)
-        return prediction
+        # # Flatten input
+        # input_flat = input_tensor.view(b, -1)
+        # noise = torch.randn(b, self.noise_dim)
+        # with torch.no_grad():
+        #     prediction = self.model(input_tensor)
+        # return prediction
+
+        x = torch.randn(80, 1, 28, 28).to('cpu')
+        y = torch.tensor([[i] * 8 for i in range(10)]).flatten().to('cpu')
+
+        # Sampling loop
+        for i, t in tqdm(enumerate(noise_scheduler.timesteps)):
+
+            # Get model pred
+            with torch.no_grad():
+                residual = net(x, t, y)  # Again, note that we pass in our labels y
+
+            # Update sample with step
+            x = noise_scheduler.step(residual, t, x).prev_sample
 
 
 # 配置路径和超参数
