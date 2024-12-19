@@ -47,6 +47,8 @@ class DiffusionDataset(Dataset):
         # label: (seq, h, w, c) -> (seq, c, h, w)
         label_tensor = label_tensor.permute(0, 3, 1, 2)
 
+        # rand = torch.rand
+
         return input_tensor, label_tensor
 
 class ConditionalBatchNorm2d(nn.Module):
@@ -170,8 +172,10 @@ def main():
 
                 if batch_idx == 1:
                     z = torch.zeros(input_tensor.size(0), latent_dim, device=device)
+                    # print("0")
                 else:
                     z = torch.ones(input_tensor.size(0), latent_dim, device=device)
+                    # print("1")
 
                 # z = torch.randn(input_tensor.size(0), latent_dim, device=device)
 
@@ -207,16 +211,16 @@ def main():
         output_dir = "output_images"
         os.makedirs(output_dir, exist_ok=True)  # 如果目录不存在则创建
 
-        for i in range(2):  # 只产生两个条件
-            if i == 0:
+        for i in range(20):  # 只产生两个条件
+            if i %2 == 0:
                 # condition0: 全零向量
                 z = torch.zeros(input_sample.size(0), latent_dim, device=device)
             else:
                 # condition1: 全一向量
                 z = torch.ones(input_sample.size(0), latent_dim, device=device)
 
-            with torch.no_grad():
-                out_video = model(input_sample, z)  # (1, 7, 3, 64, 64)
+            # z = torch.randn(input_sample.size(0), latent_dim, device=device)
+
 
             with torch.no_grad():
                 out_video = model(input_sample, z)  # (1, seq, c, h, w)
