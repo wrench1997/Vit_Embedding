@@ -4,198 +4,195 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
 import os
-from tqdm import tqdm  # 导入 tqdm 库
+from tqdm import tqdm
+from PIL import Image
 
-# 移除 DiffusionModel 的导入
-# from model.Mdiiffusion import DiffusionModel
-from model.loss import frequency_loss  # 确保 frequency_loss 在 model/loss.py 中定义
 
 class DiffusionDataset(Dataset):
-    def __init__(self, data, scale_to_minus1_1=True):
-        self.inputs = data['inputs']  # shape: (N, h, w, c)
-        self.labels = data['labels']  # shape: (N, seq, h, w, c)
+    def __init__(self, data_path, scale_to_minus1_1=True):
+        """
+        假设 data 包含:
+        data['inputs']: (N, h, w, c) 单张输入帧
+        data['labels']: (N, seq, h, w, c) 对应的未来序列
+        
+        最终:
+        input_tensor: (b, 3, 64, 64)
+        label_tensor: (b, 7, 3, 64, 64)
+        """
+        data = np.load(data_path, allow_pickle=True).item()
+        self.inputs = data['labels']   # (N, h, w, c)
+        self.labels = data['inputs']   # (N, seq, h, w, c)
         self.scale_to_minus1_1 = scale_to_minus1_1
 
     def __len__(self):
         return len(self.inputs)
 
     def __getitem__(self, idx):
-        input_frames = self.inputs[idx]     # (h, w, c)
-        label_frames = self.labels[idx]     # (seq, h, w, c)
+        input_frame = self.inputs[idx]     # (h, w, c)
+        label_frames = self.labels[idx]    # (seq, h, w, c)
 
-        input_tensor = torch.tensor(input_frames).float()
+        input_tensor = torch.tensor(input_frame).float()
         label_tensor = torch.tensor(label_frames).float()
 
-        # 如果原始数据是 [0,255]，转换到 [-1,1]
+        # 如果数据是 [0,255]，则转换到 [-1,1]
         if self.scale_to_minus1_1:
             input_tensor = (input_tensor / 255.0) * 2.0 - 1.0
             label_tensor = (label_tensor / 255.0) * 2.0 - 1.0
 
+        # 调整维度顺序
+        # input: (h, w, c) -> (c, h, w)
+        input_tensor = input_tensor.permute(2, 0, 1)
+        # label: (seq, h, w, c) -> (seq, c, h, w)
+        label_tensor = label_tensor.permute(0, 3, 1, 2)
+
         return input_tensor, label_tensor
 
 class EncoderDecoderModel(nn.Module):
-    def __init__(self, input_channels=3, output_channels=3, seq_length=7):
+    def __init__(self, input_channels=3, output_channels=3, seq_length=7, latent_dim=8):
         super(EncoderDecoderModel, self).__init__()
         self.seq_length = seq_length
+        self.latent_dim = latent_dim
 
-        # Encoder
+        # 使用线性层将潜在向量z映射到 (latent_dim, 64, 64)
+        self.fc = nn.Linear(latent_dim, latent_dim * 64 * 64)
+
         self.encoder = nn.Sequential(
-            nn.Conv2d(input_channels, 64, kernel_size=4, stride=2, padding=1),  # 32x32
+            # 输入为 (c + latent_dim, 64, 64)
+            nn.Conv2d(input_channels + latent_dim, 64, kernel_size=4, stride=2, padding=1),  # 32x32
             nn.ReLU(inplace=True),
             nn.Conv2d(64, 128, kernel_size=4, stride=2, padding=1),  # 16x16
             nn.ReLU(inplace=True),
-            nn.Conv2d(128, 256, kernel_size=4, stride=2, padding=1),  # 8x8
+            nn.Conv2d(128, 256, kernel_size=4, stride=2, padding=1), # 8x8
             nn.ReLU(inplace=True),
-            nn.Conv2d(256, 512, kernel_size=4, stride=2, padding=1),  # 4x4
+            nn.Conv2d(256, 512, kernel_size=4, stride=2, padding=1), # 4x4
             nn.ReLU(inplace=True),
         )
 
-        # Bottleneck
         self.bottleneck = nn.Sequential(
-            nn.Conv2d(512, 512, kernel_size=4, stride=2, padding=1),  # 2x2
+            nn.Conv2d(512, 512, kernel_size=4, stride=2, padding=1), # 2x2
             nn.ReLU(inplace=True),
         )
 
-        # Decoder
-        # 输出通道数调整为 2 * seq_length * output_channels
         self.decoder = nn.Sequential(
-            nn.ConvTranspose2d(512, 256, kernel_size=4, stride=2, padding=1),  # 4x4
+            nn.ConvTranspose2d(512, 256, kernel_size=4, stride=2, padding=1), # 4x4
             nn.ReLU(inplace=True),
-            nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1),  # 8x8
+            nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1), # 8x8
             nn.ReLU(inplace=True),
-            nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1),   # 16x16
+            nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1),  # 16x16
             nn.ReLU(inplace=True),
-            nn.ConvTranspose2d(64, 32, kernel_size=4, stride=2, padding=1),    # 32x32
+            nn.ConvTranspose2d(64, 32, kernel_size=4, stride=2, padding=1),   # 32x32
             nn.ReLU(inplace=True),
-            nn.ConvTranspose2d(32, 2 * output_channels * seq_length, kernel_size=4, stride=2, padding=1),  # 64x64
+            nn.ConvTranspose2d(32, output_channels * self.seq_length, kernel_size=4, stride=2, padding=1),  # 64x64
         )
 
-    def forward(self, x):
-        batch_size = x.size(0)
-        encoded = self.encoder(x)
-        bottleneck = self.bottleneck(encoded)
-        decoded = self.decoder(bottleneck)  # (b, 2 * seq * c, h, w)
+    def forward(self, x, z):
+        # x: (b, 3, 64, 64)
+        # z: (b, latent_dim)
+        b, c, h, w = x.size()
 
-        # 重塑为 (b, 2, seq, c, h, w)
-        decoded = decoded.view(batch_size, 2, self.seq_length, 3, 64, 64)
-        video1 = decoded[:, 0, :, :, :, :]  # (b, seq, c, h, w)
-        video2 = decoded[:, 1, :, :, :, :]  # (b, seq, c, h, w)
-        return video1, video2
+        z_feat = self.fc(z).view(b, self.latent_dim, 64, 64)  # (b, latent_dim, 64, 64)
+        x_cond = torch.cat([x, z_feat], dim=1)  # (b, c+latent_dim, 64, 64)
+
+        encoded = self.encoder(x_cond)
+        bottleneck = self.bottleneck(encoded)
+        decoded = self.decoder(bottleneck)  # (b, seq*c, h, w)
+
+        # reshape to (b, seq, c, h, w)
+        decoded = decoded.view(b, self.seq_length, c, h, w)
+        return decoded
 
 def main():
-    # ============ 超参数 ============
     output_data_dir = "data/diffusion_model_data"
-    checkpoint_path = os.path.join(output_data_dir, "model_checkpoint.pth")
-
-    h, w, c = 64, 64, 3
-    seq = 7
-    noise_dim = 1024  # 在编码器-解码器中未使用
-    num_epochs = int(1.2e+4)
-    batch_size = 1
-    lambda_diversity = 0.1
-    lr = 1e-5
-
-    # ============ 数据加载 ============
     data_path = os.path.join(output_data_dir, "diffusion_dataset.npy")
+    checkpoint_path = os.path.join(output_data_dir, "model_checkpoint.pth")
     if not os.path.exists(data_path):
         raise FileNotFoundError(f"数据集文件未找到: {data_path}")
-    
-    data = np.load(data_path, allow_pickle=True).item()
-    dataset = DiffusionDataset(data)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+    dataset = DiffusionDataset(data_path)
+    dataloader = DataLoader(dataset, batch_size=1, shuffle=True)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"使用设备: {device}")
 
-    # ============ 模型 & 优化器 ============
-    # 初始化编码器-解码器模型
-    model = EncoderDecoderModel(input_channels=c, output_channels=c, seq_length=seq).to(device)
-    reconstruction_loss_fn = nn.MSELoss()
-    diversity_loss_fn = nn.L1Loss()
-    optimizer = optim.Adam(model.parameters(), lr=lr)
+    seq_length = 7
+    latent_dim = 8
+    model = EncoderDecoderModel(input_channels=3, output_channels=3, seq_length=seq_length, latent_dim=latent_dim).to(device)
+    optimizer = optim.Adam(model.parameters(), lr=1e-4)
+    loss_fn = nn.MSELoss()
 
-    # ============ 尝试加载已有权重实现断点续训 ============
-    start_epoch = 0
-    if os.path.exists(checkpoint_path):
-        checkpoint = torch.load(checkpoint_path, map_location=device)
-        model.load_state_dict(checkpoint["model_state_dict"])
-        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        start_epoch = checkpoint["epoch"] + 1  # 从上次 epoch+1 开始
-        print(f"加载已有权重，从 Epoch {start_epoch} 继续训练。")
+    
 
-    # ============ 训练循环 ============
-    for epoch in range(start_epoch, num_epochs):
-        model.train()
-        running_loss = 0.0
+    is_train = False
+    if is_train:
+        num_epochs = 10000
+        for epoch in range(num_epochs):
+            model.train()
+            running_loss = 0.0
+            for batch_idx, (input_tensor  , target_video) in enumerate(dataloader):
+                # input_tensor: (b, 3, 64, 64)
+                # target_video: (b, 7, 3, 64, 64)
+                input_tensor = input_tensor.to(device)
+                target_video = target_video.to(device)
 
-        # 用 tqdm 包裹 dataloader，显示训练进度
-        with tqdm(enumerate(dataloader), total=len(dataloader), desc=f"Epoch {epoch+1}/{num_epochs}", ncols=100) as pbar:
-            for batch_idx, (target_video, input_tensor ) in pbar:
-                input_tensor = input_tensor.to(device)      # (b, h, w, c)
-                target_video = target_video.to(device)      # (b, seq, h, w, c)
+                z = torch.randn(input_tensor.size(0), latent_dim, device=device)
 
                 optimizer.zero_grad()
-                # 调整输入为 (b, c, h, w)
-                input_tensor = input_tensor.permute(0, 3, 1, 2)  # (b, c, h, w)
-
-                # 前向传播
-                output_video1, output_video2 = model(input_tensor)  # 两个视频，(b, seq, c, h, w) each
-
-                # 调整目标视频的维度为 (b, seq, c, h, w)
-                target_video = target_video.permute(0, 1, 4, 2, 3)  # (b, seq, c, h, w)
-
-                # 计算损失
-                loss1 = reconstruction_loss_fn(output_video1, target_video)
-                loss2 = reconstruction_loss_fn(output_video2, target_video)
-                fft = frequency_loss(output_video1, target_video)
-                reconstruction_loss = loss1 + loss2
-
-                # lambda_diversity = 1-reconstruction_loss
-
-
-                # 定义缩放因子 α
-                
-
-                # 计算多样性损失（鼓励两个视频的不同）
-                diversity_loss = diversity_loss_fn(output_video1, output_video2)
-                alpha = torch.clamp(reconstruction_loss / (diversity_loss + 1e-8), max=1.0)
-                total_loss = reconstruction_loss - alpha * diversity_loss + fft
-
-                # 反向传播和优化
-                total_loss.backward()
+                output = model(input_tensor, z) # (b, 7, 3, 64, 64)
+                loss = loss_fn(output, target_video)
+                loss.backward()
                 optimizer.step()
 
-                running_loss += total_loss.item()
+                running_loss += loss.item()
 
-                # 更新进度条信息
-                pbar.set_postfix({
-                    "Batch Loss": total_loss.item(),
-                    "Avg Loss": running_loss / (batch_idx + 1)
-                })
+            avg_loss = running_loss / len(dataloader)
+            print(f"Epoch [{epoch+1}/{num_epochs}] Loss: {avg_loss:.4f}")
+            if (epoch + 1) % 1000 == 0:
+                current_checkpoint_path = checkpoint_path.replace(".pth", f"_epoch{epoch+1}.pth")
+                torch.save({
+                    "epoch": epoch,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict()
+                }, current_checkpoint_path)
+                print(f"已保存 checkpoint 到: {current_checkpoint_path}")
+        print("训练完成！")
+    else:
+        checkpoint_path = os.path.join(output_data_dir, "model_checkpoint_epoch10000.pth")
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        # 使用 strict=False 以允许部分加载权重
+        model.load_state_dict(checkpoint["model_state_dict"], strict=True)
+        # 推理时，可以改变z以获得不同的预测结果
+        model.eval()
+        input_sample, target_sample = next(iter(dataloader))
+        input_sample = input_sample.to(device)
 
-        avg_loss = running_loss / len(dataloader)
-        print(f"Epoch [{epoch+1}/{num_epochs}] Loss: {avg_loss:.4f}")
+        output_dir = "output_images"
+        os.makedirs(output_dir, exist_ok=True)  # 如果目录不存在则创建
 
+        for i in range(10):
+            z = torch.randn(input_sample.size(0), latent_dim, device=device)
+            with torch.no_grad():
+                out_video = model(input_sample, z)  # (1, seq, c, h, w)
 
+            # out_video: (1, seq, 3, 64, 64)
+            # 去掉batch维度: (seq, 3, 64, 64)
+            video_frames = out_video.squeeze(0)
 
-        if (epoch + 1) % 1000 == 0:
-            current_checkpoint_path = checkpoint_path.format(epoch=epoch+1)
-            torch.save({
-                "epoch": epoch,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict()
-            }, current_checkpoint_path)
-            print(f"已保存 checkpoint 到: {current_checkpoint_path}")
+            # 将数据从[-1,1]映射到[0,1], 再转到[0,255]
+            video_frames = (video_frames + 1.0) / 2.0
+            video_frames = video_frames.clamp(0, 1) * 255.0
+            video_frames = video_frames.byte()  # 转为uint8
 
-        # # 保存模型权重和优化器状态
-        # torch.save({
-        #     "epoch": epoch,
-        #     "model_state_dict": model.state_dict(),
-        #     "optimizer_state_dict": optimizer.state_dict()
-        # }, checkpoint_path)
-        # print(f"已保存 checkpoint 到: {checkpoint_path}")
-
-    print("训练完成！")
+            # 遍历每一帧保存为png
+            seq_len = video_frames.size(0)
+            for frame_idx in range(seq_len):
+                frame = video_frames[frame_idx]  # (3, h, w)
+                frame = frame.permute(1, 2, 0).cpu().numpy()  # (h, w, c)
+                img = Image.fromarray(frame, mode='RGB')
+                frame_name = f"z{i}_frame{frame_idx+1}.png"
+                img_path = os.path.join(output_dir, frame_name)
+                img.save(img_path)
+                print(f"已保存帧：{img_path}")
+        # out_video: (1, 7, 3, 64, 64) 不同的z会产生略有差异的结果
 
 if __name__ == "__main__":
     main()

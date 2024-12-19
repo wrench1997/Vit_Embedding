@@ -3,88 +3,125 @@ import os
 from PIL import Image
 from torch.utils.data import Dataset, DataLoader
 import torch
-import matplotlib.pyplot as plt
 from collections import defaultdict
 
-# 假设你已经保存了帧图像在 data/games 文件夹中
 frames_folder = "data/games"
 frame_files = sorted([f for f in os.listdir(frames_folder) if f.endswith(".png")])
 
-# 按路径分组帧文件
 def group_frames_by_path(frame_files):
+    """
+    根据文件名中 'pathX' 部分对帧进行分组
+    文件名示例：frame_0_path1.png, frame_0_path2.png
+    """
     grouped = defaultdict(list)
     for f in frame_files:
         # 假设文件名格式为 frame_{index}_path{n}.png
         parts = f.split('_path')
         if len(parts) == 2:
-            path = 'path' + parts[1].split('.')[0]  # 提取路径标识
-            grouped[path].append(f)
+            path_str = parts[1].split('.')[0]  # path后面跟的数字
+            path_key = 'path' + path_str
+            grouped[path_key].append(f)
         else:
-            # 处理没有路径标识的情况
+            # 如果没有找到 path 标识，则放入 'default'
             grouped['default'].append(f)
     return grouped
 
 grouped_frames = group_frames_by_path(frame_files)
 
-# 设定数据集目录
+# 数据输出目录
 output_data_dir = "data/diffusion_model_data"
 if not os.path.exists(output_data_dir):
     os.makedirs(output_data_dir)
 
-# 构建数据集
 def prepare_diffusion_dataset(grouped_frames, sequence_length=8, img_size=(64, 64)):
+    """
+    为数据集准备 (inputs, labels, conditions) 字段。
+    inputs: (N, sequence_length-1, H, W, C)
+    labels: (N, H, W, C)
+    conditions: (N,) 每个样本的条件ID (int)
+    """
     data = {
         'inputs': [],
-        'labels': []
+        'labels': [],
+        'conditions': []
     }
 
+    # 为每个 path 分配一个独特的 condition_id
+    all_paths = list(grouped_frames.keys())
+    path_to_condition = {p: i for i, p in enumerate(all_paths)}
+
     for path, frames in grouped_frames.items():
-        sorted_frames = sorted(frames, key=lambda x: int(x.split('_')[1]))  # 根据索引排序
+        condition_id = path_to_condition[path]
+        
+        # 排序帧文件
+        sorted_frames = sorted(frames, key=lambda x: int(x.split('_')[1]))
+
+        # 提取序列窗口
         for i in range(len(sorted_frames) - sequence_length + 1):
+            # 前 (sequence_length-1) 帧为 inputs
             input_frames = []
-            for j in range(1, sequence_length):  # 后7帧
-                img = Image.open(os.path.join(frames_folder, sorted_frames[i + j]))
-                img = img.convert("RGB")
+            for j in range(i, i + sequence_length - 1):
+                img = Image.open(os.path.join(frames_folder, sorted_frames[j])).convert("RGB")
                 img = img.resize(img_size)
                 input_frames.append(np.array(img))
 
-            label_frame = Image.open(os.path.join(frames_folder, sorted_frames[i]))
-            label_frame = label_frame.convert("RGB")
+            # 最后一帧为 label
+            label_index = i + sequence_length - 1
+            label_frame = Image.open(os.path.join(frames_folder, sorted_frames[label_index])).convert("RGB")
             label_frame = label_frame.resize(img_size)
             label_frame = np.array(label_frame)
 
             data['inputs'].append(np.array(input_frames))
             data['labels'].append(label_frame)
+            data['conditions'].append(condition_id)
 
     return data
 
-# 生成数据集
-data = prepare_diffusion_dataset(grouped_frames)
+data = prepare_diffusion_dataset(grouped_frames, sequence_length=8, img_size=(64, 64))
 
-# 保存数据集为.npy文件
+# 保存数据集
 np.save(os.path.join(output_data_dir, "diffusion_dataset.npy"), data)
 
-# 修改 DiffusionDataset 类来处理字典格式的数据
+# 定义数据集类
 class DiffusionDataset(Dataset):
-    def __init__(self, data):
-        self.inputs = data['inputs']
-        self.labels = data['labels']
-    
+    def __init__(self, data, scale_to_minus1_1=True):
+        self.inputs = data['inputs']    # (N, seq-1, H, W, C)
+        self.labels = data['labels']    # (N, H, W, C)
+        self.conditions = data['conditions'] # (N,)
+        self.scale_to_minus1_1 = scale_to_minus1_1
+
     def __len__(self):
         return len(self.inputs)
-    
-    def __getitem__(self, idx):
-        input_frames = self.inputs[idx]
-        label_frame = self.labels[idx]
-        # 转换为 (C, T, H, W) 格式，如果需要
-        input_frames = torch.tensor(input_frames).permute(0, 3, 1, 2).float()
-        label_frame = torch.tensor(label_frame).permute(2, 0, 1).float()
-        return input_frames, label_frame
 
-# 加载数据集
+    def __getitem__(self, idx):
+        input_frames = self.inputs[idx]   # (seq-1, H, W, C)
+        label_frame = self.labels[idx]    # (H, W, C)
+        cond_id = self.conditions[idx]
+
+        input_tensor = torch.tensor(input_frames).float()  # (seq-1, H, W, C)
+        label_tensor = torch.tensor(label_frame).float()   # (H, W, C)
+
+        # 如果需要将 [0,255] 转换到 [-1,1]
+        if self.scale_to_minus1_1:
+            input_tensor = (input_tensor / 255.0) * 2.0 - 1.0
+            label_tensor = (label_tensor / 255.0) * 2.0 - 1.0
+
+        # (seq-1, H, W, C) -> (seq-1, C, H, W)
+        input_tensor = input_tensor.permute(0, 3, 1, 2)
+        # (H, W, C) -> (C, H, W)
+        label_tensor = label_tensor.permute(2, 0, 1)
+
+        return input_tensor, label_tensor, torch.tensor(cond_id, dtype=torch.long)
+
+# 测试数据加载
 data = np.load(os.path.join(output_data_dir, "diffusion_dataset.npy"), allow_pickle=True).item()
 dataset = DiffusionDataset(data)
-dataloader = DataLoader(dataset, batch_size=1)
+dataloader = DataLoader(dataset, batch_size=1, shuffle=True)
+
+inputs, label, cond_id = next(iter(dataloader))
+print("inputs shape:", inputs.shape)   # (1, seq-1, C, H, W)
+print("label shape:", label.shape)     # (1, C, H, W)
+print("cond_id:", cond_id)             # (1,) 条件ID
 
 # # 查看数据
 # def show_video_frames(y):
