@@ -1,11 +1,13 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
 import os
 from tqdm import tqdm
 from PIL import Image
+import  time
 
 
 class DiffusionDataset(Dataset):
@@ -47,9 +49,29 @@ class DiffusionDataset(Dataset):
 
         return input_tensor, label_tensor
 
-class EncoderDecoderModel(nn.Module):
-    def __init__(self, input_channels=3, output_channels=3, seq_length=7, latent_dim=8):
-        super(EncoderDecoderModel, self).__init__()
+class ConditionalBatchNorm2d(nn.Module):
+    def __init__(self, num_features, latent_dim):
+        super(ConditionalBatchNorm2d, self).__init__()
+        self.num_features = num_features
+        self.latent_dim = latent_dim
+        self.gamma_fc = nn.Linear(latent_dim, num_features)
+        self.beta_fc = nn.Linear(latent_dim, num_features)
+        # 初始化为1和0，以便初始时不改变批归一化的输出
+        nn.init.ones_(self.gamma_fc.weight)
+        nn.init.zeros_(self.beta_fc.weight)
+        nn.init.zeros_(self.gamma_fc.bias)
+        nn.init.zeros_(self.beta_fc.bias)
+
+    def forward(self, x, z):
+        gamma = self.gamma_fc(z).unsqueeze(2).unsqueeze(3)
+        beta = self.beta_fc(z).unsqueeze(2).unsqueeze(3)
+        out = F.batch_norm(x, running_mean=None, running_var=None, training=True)
+        out = gamma * out + beta
+        return out
+
+class EncoderDecoderModelCBN(nn.Module):
+    def __init__(self, input_channels=3, output_channels=3, seq_length=7, latent_dim=32):
+        super(EncoderDecoderModelCBN, self).__init__()
         self.seq_length = seq_length
         self.latent_dim = latent_dim
 
@@ -73,17 +95,22 @@ class EncoderDecoderModel(nn.Module):
             nn.ReLU(inplace=True),
         )
 
-        self.decoder = nn.Sequential(
+        # Decoder with CBN layers
+        self.decoder_layers = nn.ModuleList([
             nn.ConvTranspose2d(512, 256, kernel_size=4, stride=2, padding=1), # 4x4
             nn.ReLU(inplace=True),
+            ConditionalBatchNorm2d(256, latent_dim),
             nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1), # 8x8
             nn.ReLU(inplace=True),
+            ConditionalBatchNorm2d(128, latent_dim),
             nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1),  # 16x16
             nn.ReLU(inplace=True),
+            ConditionalBatchNorm2d(64, latent_dim),
             nn.ConvTranspose2d(64, 32, kernel_size=4, stride=2, padding=1),   # 32x32
             nn.ReLU(inplace=True),
+            ConditionalBatchNorm2d(32, latent_dim),
             nn.ConvTranspose2d(32, output_channels * self.seq_length, kernel_size=4, stride=2, padding=1),  # 64x64
-        )
+        ])
 
     def forward(self, x, z):
         # x: (b, 3, 64, 64)
@@ -91,15 +118,22 @@ class EncoderDecoderModel(nn.Module):
         b, c, h, w = x.size()
 
         z_feat = self.fc(z).view(b, self.latent_dim, 64, 64)  # (b, latent_dim, 64, 64)
-        x_cond = torch.cat([x, z_feat], dim=1)  # (b, c+latent_dim, 64, 64)
+        x_cond = torch.cat([x, z_feat], dim=1)  # (b, c + latent_dim, 64, 64)
 
         encoded = self.encoder(x_cond)
         bottleneck = self.bottleneck(encoded)
-        decoded = self.decoder(bottleneck)  # (b, seq*c, h, w)
+
+        # Decoder with CBN
+        out = bottleneck
+        for layer in self.decoder_layers:
+            if isinstance(layer, ConditionalBatchNorm2d):
+                out = layer(out, z)
+            else:
+                out = layer(out)
 
         # reshape to (b, seq, c, h, w)
-        decoded = decoded.view(b, self.seq_length, c, h, w)
-        return decoded
+        out = out.view(b, self.seq_length, c, h, w)
+        return out
 
 def main():
     output_data_dir = "data/diffusion_model_data"
@@ -109,14 +143,14 @@ def main():
         raise FileNotFoundError(f"数据集文件未找到: {data_path}")
 
     dataset = DiffusionDataset(data_path)
-    dataloader = DataLoader(dataset, batch_size=1, shuffle=True)
+    dataloader = DataLoader(dataset, batch_size=1, shuffle=False)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"使用设备: {device}")
 
     seq_length = 7
-    latent_dim = 8
-    model = EncoderDecoderModel(input_channels=3, output_channels=3, seq_length=seq_length, latent_dim=latent_dim).to(device)
+    latent_dim = 2
+    model = EncoderDecoderModelCBN(input_channels=3, output_channels=3, seq_length=seq_length, latent_dim=latent_dim).to(device)
     optimizer = optim.Adam(model.parameters(), lr=1e-4)
     loss_fn = nn.MSELoss()
 
@@ -134,7 +168,12 @@ def main():
                 input_tensor = input_tensor.to(device)
                 target_video = target_video.to(device)
 
-                z = torch.randn(input_tensor.size(0), latent_dim, device=device)
+                if batch_idx == 1:
+                    z = torch.zeros(input_tensor.size(0), latent_dim, device=device)
+                else:
+                    z = torch.ones(input_tensor.size(0), latent_dim, device=device)
+
+                # z = torch.randn(input_tensor.size(0), latent_dim, device=device)
 
                 optimizer.zero_grad()
                 output = model(input_tensor, z) # (b, 7, 3, 64, 64)
@@ -168,8 +207,17 @@ def main():
         output_dir = "output_images"
         os.makedirs(output_dir, exist_ok=True)  # 如果目录不存在则创建
 
-        for i in range(10):
-            z = torch.randn(input_sample.size(0), latent_dim, device=device)
+        for i in range(2):  # 只产生两个条件
+            if i == 0:
+                # condition0: 全零向量
+                z = torch.zeros(input_sample.size(0), latent_dim, device=device)
+            else:
+                # condition1: 全一向量
+                z = torch.ones(input_sample.size(0), latent_dim, device=device)
+
+            with torch.no_grad():
+                out_video = model(input_sample, z)  # (1, 7, 3, 64, 64)
+
             with torch.no_grad():
                 out_video = model(input_sample, z)  # (1, seq, c, h, w)
 
@@ -191,7 +239,7 @@ def main():
                 frame_name = f"z{i}_frame{frame_idx+1}.png"
                 img_path = os.path.join(output_dir, frame_name)
                 img.save(img_path)
-                print(f"已保存帧：{img_path}")
+                # print(f"已保存帧：{img_path}")
         # out_video: (1, 7, 3, 64, 64) 不同的z会产生略有差异的结果
 
 if __name__ == "__main__":
