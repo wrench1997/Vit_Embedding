@@ -1,154 +1,201 @@
 import torch
-import torchvision
-from torch import nn
-from torch.nn import functional as F
-from torch.utils.data import DataLoader
-from diffusers import DDPMScheduler, UNet2DModel
-from matplotlib import pyplot as plt
-from tqdm.auto import tqdm
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import numpy as np
+import os
+from tqdm import tqdm  # 导入 tqdm 库
 
-device = "mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu"
-print(f"Using device: {device}")
+# 移除 DiffusionModel 的导入
+# from model.Mdiiffusion import DiffusionModel
+from model.loss import frequency_loss  # 确保 frequency_loss 在 model/loss.py 中定义
 
+class DiffusionDataset(Dataset):
+    def __init__(self, data, scale_to_minus1_1=True):
+        self.inputs = data['inputs']  # shape: (N, h, w, c)
+        self.labels = data['labels']  # shape: (N, seq, h, w, c)
+        self.scale_to_minus1_1 = scale_to_minus1_1
 
+    def __len__(self):
+        return len(self.inputs)
 
-dataset = torchvision.datasets.MNIST(
-    root="mnist/", train=True, download=True, transform=torchvision.transforms.ToTensor()
-)
+    def __getitem__(self, idx):
+        input_frames = self.inputs[idx]     # (h, w, c)
+        label_frames = self.labels[idx]     # (seq, h, w, c)
 
-# Feed it into a dataloader (batch size 8 here just for demo)
-train_dataloader = DataLoader(dataset, batch_size=8, shuffle=True)
+        input_tensor = torch.tensor(input_frames).float()
+        label_tensor = torch.tensor(label_frames).float()
 
-# View some examples
-x, y = next(iter(train_dataloader))
-print("Input shape:", x.shape)
-print("Labels:", y)
-plt.imshow(torchvision.utils.make_grid(x)[0], cmap="Greys")
+        # 如果原始数据是 [0,255]，转换到 [-1,1]
+        if self.scale_to_minus1_1:
+            input_tensor = (input_tensor / 255.0) * 2.0 - 1.0
+            label_tensor = (label_tensor / 255.0) * 2.0 - 1.0
 
+        return input_tensor, label_tensor
 
+class EncoderDecoderModel(nn.Module):
+    def __init__(self, input_channels=3, output_channels=3, seq_length=7):
+        super(EncoderDecoderModel, self).__init__()
+        self.seq_length = seq_length
 
-class ClassConditionedUnet(nn.Module):
-    def __init__(self, num_classes=10, class_emb_size=4):
-        super().__init__()
-
-        # The embedding layer will map the class label to a vector of size class_emb_size
-        self.class_emb = nn.Embedding(num_classes, class_emb_size)
-
-        # Self.model is an unconditional UNet with extra input channels to accept the conditioning information (the class embedding)
-        self.model = UNet2DModel(
-            sample_size=28,  # the target image resolution
-            in_channels=1 + class_emb_size,  # Additional input channels for class cond.
-            out_channels=1,  # the number of output channels
-            layers_per_block=2,  # how many ResNet layers to use per UNet block
-            block_out_channels=(32, 64, 64),
-            down_block_types=(
-                "DownBlock2D",  # a regular ResNet downsampling block
-                "AttnDownBlock2D",  # a ResNet downsampling block with spatial self-attention
-                "AttnDownBlock2D",
-            ),
-            up_block_types=(
-                "AttnUpBlock2D",
-                "AttnUpBlock2D",  # a ResNet upsampling block with spatial self-attention
-                "UpBlock2D",  # a regular ResNet upsampling block
-            ),
+        # Encoder
+        self.encoder = nn.Sequential(
+            nn.Conv2d(input_channels, 64, kernel_size=4, stride=2, padding=1),  # 32x32
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 128, kernel_size=4, stride=2, padding=1),  # 16x16
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, 256, kernel_size=4, stride=2, padding=1),  # 8x8
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, 512, kernel_size=4, stride=2, padding=1),  # 4x4
+            nn.ReLU(inplace=True),
         )
 
-    # Our forward method now takes the class labels as an additional argument
-    def forward(self, x, t, class_labels):
-        # Shape of x:
-        bs, ch, w, h = x.shape
+        # Bottleneck
+        self.bottleneck = nn.Sequential(
+            nn.Conv2d(512, 512, kernel_size=4, stride=2, padding=1),  # 2x2
+            nn.ReLU(inplace=True),
+        )
 
-        # class conditioning in right shape to add as additional input channels
-        class_cond = self.class_emb(class_labels)  # Map to embedding dimension
-        class_cond = class_cond.view(bs, class_cond.shape[1], 1, 1).expand(bs, class_cond.shape[1], w, h)
-        # x is shape (bs, 1, 28, 28) and class_cond is now (bs, 4, 28, 28)
+        # Decoder
+        # 输出通道数调整为 2 * seq_length * output_channels
+        self.decoder = nn.Sequential(
+            nn.ConvTranspose2d(512, 256, kernel_size=4, stride=2, padding=1),  # 4x4
+            nn.ReLU(inplace=True),
+            nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1),  # 8x8
+            nn.ReLU(inplace=True),
+            nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1),   # 16x16
+            nn.ReLU(inplace=True),
+            nn.ConvTranspose2d(64, 32, kernel_size=4, stride=2, padding=1),    # 32x32
+            nn.ReLU(inplace=True),
+            nn.ConvTranspose2d(32, 2 * output_channels * seq_length, kernel_size=4, stride=2, padding=1),  # 64x64
+        )
 
-        # Net input is now x and class cond concatenated together along dimension 1
-        net_input = torch.cat((x, class_cond), 1)  # (bs, 5, 28, 28)
+    def forward(self, x):
+        batch_size = x.size(0)
+        encoded = self.encoder(x)
+        bottleneck = self.bottleneck(encoded)
+        decoded = self.decoder(bottleneck)  # (b, 2 * seq * c, h, w)
 
-        # Feed this to the UNet alongside the timestep and return the prediction
-        return self.model(net_input, t).sample  # (bs, 1, 28, 28)
+        # 重塑为 (b, 2, seq, c, h, w)
+        decoded = decoded.view(batch_size, 2, self.seq_length, 3, 64, 64)
+        video1 = decoded[:, 0, :, :, :, :]  # (b, seq, c, h, w)
+        video2 = decoded[:, 1, :, :, :, :]  # (b, seq, c, h, w)
+        return video1, video2
+
+def main():
+    # ============ 超参数 ============
+    output_data_dir = "data/diffusion_model_data"
+    checkpoint_path = os.path.join(output_data_dir, "model_checkpoint.pth")
+
+    h, w, c = 64, 64, 3
+    seq = 7
+    noise_dim = 1024  # 在编码器-解码器中未使用
+    num_epochs = int(1.2e+4)
+    batch_size = 1
+    lambda_diversity = 0.1
+    lr = 1e-5
+
+    # ============ 数据加载 ============
+    data_path = os.path.join(output_data_dir, "diffusion_dataset.npy")
+    if not os.path.exists(data_path):
+        raise FileNotFoundError(f"数据集文件未找到: {data_path}")
     
+    data = np.load(data_path, allow_pickle=True).item()
+    dataset = DiffusionDataset(data)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
-# Create a scheduler
-noise_scheduler = DDPMScheduler(num_train_timesteps=1000, beta_schedule="squaredcos_cap_v2")
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"使用设备: {device}")
 
+    # ============ 模型 & 优化器 ============
+    # 初始化编码器-解码器模型
+    model = EncoderDecoderModel(input_channels=c, output_channels=c, seq_length=seq).to(device)
+    reconstruction_loss_fn = nn.MSELoss()
+    diversity_loss_fn = nn.L1Loss()
+    optimizer = optim.Adam(model.parameters(), lr=lr)
 
+    # ============ 尝试加载已有权重实现断点续训 ============
+    start_epoch = 0
+    if os.path.exists(checkpoint_path):
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        model.load_state_dict(checkpoint["model_state_dict"])
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        start_epoch = checkpoint["epoch"] + 1  # 从上次 epoch+1 开始
+        print(f"加载已有权重，从 Epoch {start_epoch} 继续训练。")
 
-# @markdown Training loop (10 Epochs):
+    # ============ 训练循环 ============
+    for epoch in range(start_epoch, num_epochs):
+        model.train()
+        running_loss = 0.0
 
-# Redefining the dataloader to set the batch size higher than the demo of 8
-train_dataloader = DataLoader(dataset, batch_size=128, shuffle=True)
+        # 用 tqdm 包裹 dataloader，显示训练进度
+        with tqdm(enumerate(dataloader), total=len(dataloader), desc=f"Epoch {epoch+1}/{num_epochs}", ncols=100) as pbar:
+            for batch_idx, (target_video, input_tensor ) in pbar:
+                input_tensor = input_tensor.to(device)      # (b, h, w, c)
+                target_video = target_video.to(device)      # (b, seq, h, w, c)
 
-# How many runs through the data should we do?
-n_epochs = 10
+                optimizer.zero_grad()
+                # 调整输入为 (b, c, h, w)
+                input_tensor = input_tensor.permute(0, 3, 1, 2)  # (b, c, h, w)
 
-# Our network
-net = ClassConditionedUnet().to(device)
+                # 前向传播
+                output_video1, output_video2 = model(input_tensor)  # 两个视频，(b, seq, c, h, w) each
 
-# Our loss function
-loss_fn = nn.MSELoss()
+                # 调整目标视频的维度为 (b, seq, c, h, w)
+                target_video = target_video.permute(0, 1, 4, 2, 3)  # (b, seq, c, h, w)
 
-# The optimizer
-opt = torch.optim.Adam(net.parameters(), lr=1e-3)
+                # 计算损失
+                loss1 = reconstruction_loss_fn(output_video1, target_video)
+                loss2 = reconstruction_loss_fn(output_video2, target_video)
+                fft = frequency_loss(output_video1, target_video)
+                reconstruction_loss = loss1 + loss2
 
-# Keeping a record of the losses for later viewing
-losses = []
-
-# The training loop
-for epoch in range(n_epochs):
-    for x, y in tqdm(train_dataloader):
-
-        # Get some data and prepare the corrupted version
-        x = x.to(device) * 2 - 1  # Data on the GPU (mapped to (-1, 1))
-        y = y.to(device)
-        noise = torch.randn_like(x)
-        timesteps = torch.randint(0, 999, (x.shape[0],)).long().to(device)
-        noisy_x = noise_scheduler.add_noise(x, noise, timesteps)
-
-        # Get the model prediction
-        pred = net(noisy_x, timesteps, y)  # Note that we pass in the labels y
-
-        # Calculate the loss
-        loss = loss_fn(pred, noise)  # How close is the output to the noise
-
-        # Backprop and update the params:
-        opt.zero_grad()
-        loss.backward()
-        opt.step()
-
-        # Store the loss for later
-        losses.append(loss.item())
-
-    # Print out the average of the last 100 loss values to get an idea of progress:
-    avg_loss = sum(losses[-100:]) / 100
-    print(f"Finished epoch {epoch}. Average of the last 100 loss values: {avg_loss:05f}")
-
-# View the loss curve
-plt.plot(losses)
+                # lambda_diversity = 1-reconstruction_loss
 
 
+                # 定义缩放因子 α
+                
+
+                # 计算多样性损失（鼓励两个视频的不同）
+                diversity_loss = diversity_loss_fn(output_video1, output_video2)
+                alpha = torch.clamp(reconstruction_loss / (diversity_loss + 1e-8), max=1.0)
+                total_loss = reconstruction_loss - alpha * diversity_loss + fft
+
+                # 反向传播和优化
+                total_loss.backward()
+                optimizer.step()
+
+                running_loss += total_loss.item()
+
+                # 更新进度条信息
+                pbar.set_postfix({
+                    "Batch Loss": total_loss.item(),
+                    "Avg Loss": running_loss / (batch_idx + 1)
+                })
+
+        avg_loss = running_loss / len(dataloader)
+        print(f"Epoch [{epoch+1}/{num_epochs}] Loss: {avg_loss:.4f}")
 
 
 
-# @markdown Sampling some different digits:
+        if (epoch + 1) % 1000 == 0:
+            current_checkpoint_path = checkpoint_path.format(epoch=epoch+1)
+            torch.save({
+                "epoch": epoch,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict()
+            }, current_checkpoint_path)
+            print(f"已保存 checkpoint 到: {current_checkpoint_path}")
 
-# Prepare random x to start from, plus some desired labels y
-x = torch.randn(80, 1, 28, 28).to(device)
-y = torch.tensor([[i] * 8 for i in range(10)]).flatten().to(device)
+        # # 保存模型权重和优化器状态
+        # torch.save({
+        #     "epoch": epoch,
+        #     "model_state_dict": model.state_dict(),
+        #     "optimizer_state_dict": optimizer.state_dict()
+        # }, checkpoint_path)
+        # print(f"已保存 checkpoint 到: {checkpoint_path}")
 
-# Sampling loop
-for i, t in tqdm(enumerate(noise_scheduler.timesteps)):
+    print("训练完成！")
 
-    # Get model pred
-    with torch.no_grad():
-        residual = net(x, t, y)  # Again, note that we pass in our labels y
-
-    # Update sample with step
-    x = noise_scheduler.step(residual, t, x).prev_sample
-
-# Show the results
-fig, ax = plt.subplots(1, 1, figsize=(12, 12))
-ax.imshow(torchvision.utils.make_grid(x.detach().cpu().clip(-1, 1), nrow=8)[0], cmap="Greys")
-
-input('exit....')
+if __name__ == "__main__":
+    main()
