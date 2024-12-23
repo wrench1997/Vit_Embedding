@@ -71,24 +71,44 @@ class ConditionalBatchNorm2d(nn.Module):
         out = gamma * out + beta
         return out
 
+class ConditionalBatchNorm2d(nn.Module):
+    def __init__(self, num_features, latent_dim):
+        super(ConditionalBatchNorm2d, self).__init__()
+        self.num_features = num_features
+        self.latent_dim = latent_dim
+        self.gamma_fc = nn.Linear(latent_dim, num_features)
+        self.beta_fc = nn.Linear(latent_dim, num_features)
+        nn.init.ones_(self.gamma_fc.weight)
+        nn.init.zeros_(self.beta_fc.weight)
+        nn.init.zeros_(self.gamma_fc.bias)
+        nn.init.zeros_(self.beta_fc.bias)
+
+    def forward(self, x, z):
+        gamma = self.gamma_fc(z).unsqueeze(2).unsqueeze(3)
+        beta = self.beta_fc(z).unsqueeze(2).unsqueeze(3)
+        out = F.batch_norm(x, running_mean=None, running_var=None, training=True)
+        out = gamma * out + beta
+        return out
+
 class EncoderDecoderModelCBN(nn.Module):
-    def __init__(self, input_channels=3, output_channels=3, seq_length=7, latent_dim=32):
+    def __init__(self, input_channels=3, output_channels=3, seq_length=7, latent_dim=32, num_classes=2):
         super(EncoderDecoderModelCBN, self).__init__()
         self.seq_length = seq_length
         self.latent_dim = latent_dim
+        self.num_classes = num_classes
 
-        # 使用线性层将潜在向量z映射到 (latent_dim, 64, 64)
+        # 将潜在向量z映射到 (latent_dim, 64, 64)
         self.fc = nn.Linear(latent_dim, latent_dim * 64 * 64)
 
+        # encoder
         self.encoder = nn.Sequential(
-            # 输入为 (c + latent_dim, 64, 64)
-            nn.Conv2d(input_channels + latent_dim, 64, kernel_size=4, stride=2, padding=1),  # 32x32
+            nn.Conv2d(input_channels + latent_dim, 64, kernel_size=4, stride=2, padding=1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(64, 128, kernel_size=4, stride=2, padding=1),  # 16x16
+            nn.Conv2d(64, 128, kernel_size=4, stride=2, padding=1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(128, 256, kernel_size=4, stride=2, padding=1), # 8x8
+            nn.Conv2d(128, 256, kernel_size=4, stride=2, padding=1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(256, 512, kernel_size=4, stride=2, padding=1), # 4x4
+            nn.Conv2d(256, 512, kernel_size=4, stride=2, padding=1),
             nn.ReLU(inplace=True),
         )
 
@@ -97,45 +117,95 @@ class EncoderDecoderModelCBN(nn.Module):
             nn.ReLU(inplace=True),
         )
 
+        # 无监督分类头（这里只是一个线性层输出类logits）
+        # 输入尺寸：bottleneck后是 (b, 512, 2, 2)，flatten成 (b, 512*2*2)
+        self.classifier = nn.Linear(512*2*2, self.num_classes)
+
+        # 类嵌入，用来为每个类生成一个特定的条件向量
+        self.class_emb = nn.Embedding(self.num_classes, latent_dim)
+        nn.init.normal_(self.class_emb.weight, 0, 0.02) # 可根据需要初始化
+
         # Decoder with CBN layers
+        # 解码器中使用ConditionalBatchNorm2d，需要latent_dim作为条件输入
         self.decoder_layers = nn.ModuleList([
             nn.ConvTranspose2d(512, 256, kernel_size=4, stride=2, padding=1), # 4x4
             nn.ReLU(inplace=True),
             ConditionalBatchNorm2d(256, latent_dim),
+
             nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1), # 8x8
             nn.ReLU(inplace=True),
             ConditionalBatchNorm2d(128, latent_dim),
+
             nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1),  # 16x16
             nn.ReLU(inplace=True),
             ConditionalBatchNorm2d(64, latent_dim),
+
             nn.ConvTranspose2d(64, 32, kernel_size=4, stride=2, padding=1),   # 32x32
             nn.ReLU(inplace=True),
             ConditionalBatchNorm2d(32, latent_dim),
+
             nn.ConvTranspose2d(32, output_channels * self.seq_length, kernel_size=4, stride=2, padding=1),  # 64x64
         ])
 
-    def forward(self, x, z):
+    def forward(self, x, z, fixed_class_id=None):
         # x: (b, 3, 64, 64)
         # z: (b, latent_dim)
         b, c, h, w = x.size()
 
+        # 将z映射成图像特征，与输入图像拼接
         z_feat = self.fc(z).view(b, self.latent_dim, 64, 64)  # (b, latent_dim, 64, 64)
         x_cond = torch.cat([x, z_feat], dim=1)  # (b, c + latent_dim, 64, 64)
 
         encoded = self.encoder(x_cond)
-        bottleneck = self.bottleneck(encoded)
+        bottleneck = self.bottleneck(encoded) # (b, 512, 2, 2)
 
-        # Decoder with CBN
+        # 分类部分
+        bottleneck_flat = bottleneck.view(b, -1)
+        class_logits = self.classifier(bottleneck_flat)  # (b, num_classes)
+        
+        if fixed_class_id is None:
+            # 如果未指定类ID，则使用argmax作为类的选择示例
+            class_id = torch.argmax(class_logits, dim=1)
+        else:
+            # 使用固定给定的类ID（如需要特定条件控制）
+            class_id = torch.full((b,), fixed_class_id, dtype=torch.long, device=x.device)
+
+        # 获取类嵌入向量
+        class_vector = self.class_emb(class_id) # (b, latent_dim)
+
+        # 将类嵌入与z结合，这里简单相加作为条件向量
+        z_combined = z + class_vector
+
+        # 根据新条件z_combined再生成特征输入decoder
+        # 与原实现不同，这里用z_combined替换z去生成z_feat是可行的选择
+        # 如果希望保持与编码器输入一致，可在最初就使用z_combined代替z。
+        # 为了简单，这里继续使用z_combined来对decoder中的CBN做条件。
+        # decoder不需要重新映射z了，因为decoder的CBN直接接收z，本来就是从forward中传入的。
+        # 不过我们最初对x做拼接时使用的是原z_feat，理论上如果需要严格意义上用分类后的z_combined作为条件，
+        # 需要重新生成z_feat用于encoder的输入。但这样会导致训练不稳定（因为分类依赖encoder输出，又改变encoder输入）。
+        # 简化起见，不改encoder输入，只改decoder时的条件输入。
+        # 如果要求严格条件作用在最终生成，可将fc映射的代码由z替换成z_combined。
+        
+        # 若希望decoder也使用z_combined生成特征图，可重复:
+        # z_feat_dec = self.fc(z_combined).view(b, self.latent_dim, 64, 64)
+        # 但这样需对网络结构进行调整。
+        # 这里示例就直接在CBN时传入z_combined。
+        
         out = bottleneck
-        for layer in self.decoder_layers:
+        idx = 0
+        while idx < len(self.decoder_layers):
+            layer = self.decoder_layers[idx]
             if isinstance(layer, ConditionalBatchNorm2d):
-                out = layer(out, z)
+                # CBN层使用z_combined作为条件
+                out = layer(out, z_combined)
+                idx += 1
             else:
                 out = layer(out)
+                idx += 1
 
         # reshape to (b, seq, c, h, w)
         out = out.view(b, self.seq_length, c, h, w)
-        return out
+        return out, class_logits
 
 def main():
     output_data_dir = "data/diffusion_model_data"
@@ -158,7 +228,7 @@ def main():
 
     
 
-    is_train = True
+    is_train = False
     if is_train:
         num_epochs = 10000
         for epoch in range(num_epochs):
@@ -170,17 +240,17 @@ def main():
                 input_tensor = input_tensor.to(device)
                 target_video = target_video.to(device)
 
-                if batch_idx == 1:
-                    z = torch.zeros(input_tensor.size(0), latent_dim, device=device)
-                    # print("0")
-                else:
-                    z = torch.ones(input_tensor.size(0), latent_dim, device=device)
-                    # print("1")
+                # if batch_idx == 1:
+                #     z = torch.zeros(input_tensor.size(0), latent_dim, device=device)
+                #     # print("0")
+                # else:
+                #     z = torch.ones(input_tensor.size(0), latent_dim, device=device)
+                #     # print("1")
 
-                # z = torch.randn(input_tensor.size(0), latent_dim, device=device)
+                z = torch.randn(input_tensor.size(0), latent_dim, device=device)
 
                 optimizer.zero_grad()
-                output = model(input_tensor, z) # (b, 7, 3, 64, 64)
+                output, class_logits  = model(input_tensor, z) # (b, 7, 3, 64, 64)
                 loss = loss_fn(output, target_video)
                 loss.backward()
                 optimizer.step()
@@ -212,18 +282,18 @@ def main():
         os.makedirs(output_dir, exist_ok=True)  # 如果目录不存在则创建
 
         for i in range(20):  # 只产生两个条件
-            if i %2 == 0:
-                # condition0: 全零向量
-                z = torch.zeros(input_sample.size(0), latent_dim, device=device)
-            else:
-                # condition1: 全一向量
-                z = torch.ones(input_sample.size(0), latent_dim, device=device)
+            # if i %2 == 0:
+            #     # condition0: 全零向量
+            #     z = torch.zeros(input_sample.size(0), latent_dim, device=device)
+            # else:
+            #     # condition1: 全一向量
+            #     z = torch.ones(input_sample.size(0), latent_dim, device=device)
 
-            # z = torch.randn(input_sample.size(0), latent_dim, device=device)
+            z = torch.randn(input_sample.size(0), latent_dim, device=device)
 
 
             with torch.no_grad():
-                out_video = model(input_sample, z)  # (1, seq, c, h, w)
+                out_video ,class_logits  = model(input_sample, z)  # (1, seq, c, h, w)
 
             # out_video: (1, seq, 3, 64, 64)
             # 去掉batch维度: (seq, 3, 64, 64)

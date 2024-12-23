@@ -30,3 +30,7 @@ future_frames
 mnist
 
 output_images/*
+
+output_images_bak/*
+
+
