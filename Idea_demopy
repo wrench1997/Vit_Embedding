@@ -1,0 +1,294 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import TensorDataset, DataLoader
+
+# 固定随机种子，便于复现
+np.random.seed(42)
+torch.manual_seed(42)
+
+# -------------------------------------------------------
+# 1. 设定参数
+# -------------------------------------------------------
+fs_signal = 3.0       # 低频信号频率 (Hz)
+fs_sample = 2.5 * 10.0  # 采样频率，略大于 Nyquist 频率（10 Hz）
+T_total = 10.0        # 信号持续时长 (秒)
+num_samples = int(fs_sample * T_total)  # 采样点数量
+t_end = T_total       # 采样/重建的结束时间
+
+# -------------------------------------------------------
+# 2. 生成连续时间上的原信号（仅低频信号，无高频成分）
+# -------------------------------------------------------
+def original_signal(t):
+    return np.sin(2 * np.pi * fs_signal * t)
+
+# 高分辨率时间轴，用于查看原始信号
+t_continuous = np.linspace(0, t_end, 2000)
+x_continuous = original_signal(t_continuous)
+
+# -------------------------------------------------------
+# 3. 离散采样（在采样时刻点）
+# -------------------------------------------------------
+t_samples = np.linspace(0, t_end, num_samples, endpoint=False)  
+x_samples = original_signal(t_samples)
+
+# -------------------------------------------------------
+# 4. Shannon 公式重建 (sinc 插值)
+#    x_recon(t) = sum_{n} x[n] * sinc((t - n*T_s) / T_s)
+# -------------------------------------------------------
+def shannon_reconstruct_vectorized(t_array, x_samp, t_samp):
+    """
+    向量化实现的Shannon重建
+    t_array: 连续时间点（要在这些点上计算重建值）
+    x_samp : 采样后的离散值 x[n]
+    t_samp : 采样时刻对应的时间序列
+    
+    return: 与 t_array 等长的、基于 sinc 插值的重建信号
+    """
+    Ts = t_samp[1] - t_samp[0]  # 采样间隔
+    # 创建一个矩阵，每行对应一个重建点，每列对应一个采样点
+    t_matrix = t_array[:, np.newaxis]  # shape (M, 1)
+    t_samp_matrix = t_samp[np.newaxis, :]  # shape (1, N)
+    u = (t_matrix - t_samp_matrix) / Ts  # shape (M, N)
+    # 计算sinc函数并进行加权求和
+    x_reconstructed = np.sum(x_samp * np.sinc(u), axis=1)
+    return x_reconstructed
+
+# 重建信号
+t_recon = np.linspace(0, t_end, 2000)  # 重建时间轴
+x_recon = shannon_reconstruct_vectorized(t_recon, x_samples, t_samples)
+
+# -------------------------------------------------------
+# 5. 可视化对比：原信号 vs 采样点 vs 重建信号
+# -------------------------------------------------------
+plt.figure(figsize=(14, 6))
+
+# 原信号
+plt.plot(t_continuous, x_continuous, 'k--', label='Original Signal (Continuous)', alpha=0.7)
+
+# 采样点
+plt.plot(t_samples, x_samples, 'ro', label='Sampled Points')
+
+# 重建信号
+plt.plot(t_recon, x_recon, 'b-', label='Reconstructed (Shannon Vectorized)')
+
+plt.title('Shannon Sampling Theorem Demo')
+plt.xlabel('Time (s)')
+plt.ylabel('Amplitude')
+plt.grid(True)
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+# -------------------------------------------------------
+# 6. 构建LSTM预测数据集
+# -------------------------------------------------------
+# 使用x_recon作为低频数据
+low_freq_data = x_recon
+
+# 由于信号持续时长为10秒，采样频率为25 Hz，共250个采样点
+# 将重建信号x_recon与采样点x_samples对齐
+# 选择与重建信号相对应的采样点位置
+# 例如，取重建信号中的25个采样点作为高频数据
+# 并使用这些高频数据来预测低频信号
+
+# 为了创建更多样本，使用滑动窗口的方法
+window_size = 10  # 使用过去10个采样点预测下一个低频值
+
+X = []
+Y = []
+
+for i in range(len(x_samples) - window_size):
+    X.append(x_samples[i:i+window_size])
+    Y.append(low_freq_data[i+window_size])  # 目标是重建信号的下一个点
+
+X = np.array(X)  # 形状: (samples, window_size)
+Y = np.array(Y)  # 形状: (samples,)
+
+print(f"Input shape: {X.shape}")
+print(f"Target shape: {Y.shape}")
+
+# 划分训练/验证/测试集
+train_ratio = 0.7
+val_ratio = 0.15
+test_ratio = 0.15
+
+total_samples = len(X)
+train_size = int(total_samples * train_ratio)
+val_size = int(total_samples * val_ratio)
+test_size = total_samples - train_size - val_size
+
+X_train = X[:train_size]
+Y_train = Y[:train_size]
+
+X_val = X[train_size:train_size + val_size]
+Y_val = Y[train_size:train_size + val_size]
+
+X_test = X[train_size + val_size:]
+Y_test = Y[train_size + val_size:]
+
+print(f"Train set: {X_train.shape}, {Y_train.shape}")
+print(f"Validation set: {X_val.shape}, {Y_val.shape}")
+print(f"Test set: {X_test.shape}, {Y_test.shape}")
+
+# 转换为 PyTorch 张量
+# LSTM 输入需要 (batch, seq_len, input_size)
+# 这里 input_size = 1
+X_train_t = torch.tensor(X_train, dtype=torch.float32).unsqueeze(-1)  # (train_size, window_size, 1)
+Y_train_t = torch.tensor(Y_train, dtype=torch.float32).unsqueeze(-1)  # (train_size, 1)
+
+X_val_t = torch.tensor(X_val, dtype=torch.float32).unsqueeze(-1)
+Y_val_t = torch.tensor(Y_val, dtype=torch.float32).unsqueeze(-1)
+
+X_test_t = torch.tensor(X_test, dtype=torch.float32).unsqueeze(-1)
+Y_test_t = torch.tensor(Y_test, dtype=torch.float32).unsqueeze(-1)
+
+print(f"X_train_t shape: {X_train_t.shape}")
+print(f"Y_train_t shape: {Y_train_t.shape}")
+print(f"X_val_t shape: {X_val_t.shape}")
+print(f"Y_val_t shape: {Y_val_t.shape}")
+print(f"X_test_t shape: {X_test_t.shape}")
+print(f"Y_test_t shape: {Y_test_t.shape}")
+
+# -------------------------------------------------------
+# 7. 定义LSTM模型
+# -------------------------------------------------------
+class LSTMForecast(nn.Module):
+    def __init__(self, input_size=1, hidden_size=64, num_layers=2):
+        super(LSTMForecast, self).__init__()
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        # LSTM层
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
+        # 全连接层
+        self.fc = nn.Linear(hidden_size, 1)
+    
+    def forward(self, x):
+        # 初始化隐藏状态和细胞状态
+        h0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(x.device)  # (num_layers, batch, hidden_size)
+        c0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(x.device)
+        
+        # 前向传播 LSTM
+        out, _ = self.lstm(x, (h0, c0))  # out: (batch, seq_len, hidden_size)
+        
+        # 取最后一个时间步的输出
+        out = out[:, -1, :]  # (batch, hidden_size)
+        out = self.fc(out)    # (batch, 1)
+        return out
+
+# 实例化模型
+model = LSTMForecast(input_size=1, hidden_size=64, num_layers=2)
+print(model)
+
+# -------------------------------------------------------
+# 8. 训练模型
+# -------------------------------------------------------
+# 超参数
+learning_rate = 1e-4
+num_epochs = 50
+batch_size = 64
+
+# 损失函数和优化器
+criterion = nn.MSELoss()
+optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+
+# 数据加载器
+train_dataset = TensorDataset(X_train_t, Y_train_t)
+val_dataset = TensorDataset(X_val_t, Y_val_t)
+test_dataset = TensorDataset(X_test_t, Y_test_t)
+
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+
+# 训练循环
+train_losses = []
+val_losses = []
+
+for epoch in range(num_epochs):
+    model.train()
+    running_train_loss = 0.0
+    for X_batch, Y_batch in train_loader:
+        optimizer.zero_grad()
+        outputs = model(X_batch)
+        loss = criterion(outputs, Y_batch)
+        loss.backward()
+        optimizer.step()
+        running_train_loss += loss.item() * X_batch.size(0)
+    epoch_train_loss = running_train_loss / train_size
+    train_losses.append(epoch_train_loss)
+    
+    # 验证
+    model.eval()
+    running_val_loss = 0.0
+    with torch.no_grad():
+        for X_batch, Y_batch in val_loader:
+            outputs = model(X_batch)
+            loss = criterion(outputs, Y_batch)
+            running_val_loss += loss.item() * X_batch.size(0)
+    epoch_val_loss = running_val_loss / val_size
+    val_losses.append(epoch_val_loss)
+    
+    print(f"Epoch [{epoch+1}/{num_epochs}] | Train Loss: {epoch_train_loss:.6f} | Val Loss: {epoch_val_loss:.6f}")
+
+# -------------------------------------------------------
+# 9. 测试集预测
+# -------------------------------------------------------
+model.eval()
+predictions = []
+true_values = []
+
+with torch.no_grad():
+    for X_batch, Y_batch in test_loader:
+        outputs = model(X_batch)
+        predictions.append(outputs.squeeze().numpy())
+        true_values.append(Y_batch.squeeze().numpy())
+
+predictions = np.concatenate(predictions)
+true_values = np.concatenate(true_values)
+
+# -------------------------------------------------------
+# 10. 可视化结果
+# -------------------------------------------------------
+# (A) 训练和验证损失曲线
+plt.figure(figsize=(10, 4))
+plt.plot(range(1, num_epochs+1), train_losses, label='Train Loss')
+plt.plot(range(1, num_epochs+1), val_losses, label='Validation Loss')
+plt.xlabel('Epoch')
+plt.ylabel('MSE Loss')
+plt.title('Training and Validation Loss')
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+# (B) 测试集上的预测 vs 真实值
+plt.figure(figsize=(14, 6))
+plt.plot(t_recon[window_size + train_size + val_size : window_size + train_size + val_size + test_size],
+         true_values, label='True Low-Freq Signal', color='blue')
+plt.plot(t_recon[window_size + train_size + val_size : window_size + train_size + val_size + test_size],
+         predictions, label='Predicted Low-Freq Signal', color='red', alpha=0.7)
+plt.xlabel('Time (s)')
+plt.ylabel('Amplitude')
+plt.title('LSTM Prediction on Test Set')
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+# (C) 综合比较：原始信号、采样点、重建信号和LSTM预测
+plt.figure(figsize=(14, 6))
+plt.plot(t_continuous, x_continuous, 'k--', label='Original Low-Freq Signal (Continuous)', alpha=0.7)
+plt.plot(t_samples, x_samples, 'ro', label='Sampled Points')
+plt.plot(t_recon, x_recon, 'b-', label='Reconstructed (Shannon Vectorized)')
+plt.plot(t_recon[window_size + train_size + val_size : window_size + train_size + val_size + test_size],
+         predictions, 'g-', label='LSTM Predicted Low-Freq', alpha=0.7)
+plt.xlabel('Time (s)')
+plt.ylabel('Amplitude')
+plt.title('Comparison of Original, Sampled, Reconstructed, and LSTM Predicted Signals')
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.show()
