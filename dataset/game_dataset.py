@@ -66,7 +66,7 @@ def prepare_diffusion_dataset(grouped_frames, sequence_length=8, img_size=(64, 6
                 input_frames.append(np.array(img))
 
             # 最后一帧为 label
-            label_index = i + sequence_length - 1
+            label_index = i # + sequence_length - 1
             label_frame = Image.open(os.path.join(frames_folder, sorted_frames[label_index])).convert("RGB")
             label_frame = label_frame.resize(img_size)
             label_frame = np.array(label_frame)
@@ -116,7 +116,7 @@ class DiffusionDataset(Dataset):
 # 测试数据加载
 data = np.load(os.path.join(output_data_dir, "diffusion_dataset.npy"), allow_pickle=True).item()
 dataset = DiffusionDataset(data)
-dataloader = DataLoader(dataset, batch_size=1, shuffle=True)
+dataloader = DataLoader(dataset, batch_size=1, shuffle=False)
 
 inputs, label, cond_id = next(iter(dataloader))
 print("inputs shape:", inputs.shape)   # (1, seq-1, C, H, W)

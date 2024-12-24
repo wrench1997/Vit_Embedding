@@ -8,6 +8,10 @@ import os
 from tqdm import tqdm
 from PIL import Image
 import  time
+from utils.utils import *
+import matplotlib.pyplot as plt
+from PIL import Image
+
 
 
 class DiffusionDataset(Dataset):
@@ -158,7 +162,7 @@ def main():
 
     
 
-    is_train = True
+    is_train = False
     if is_train:
         num_epochs = 10000
         for epoch in range(num_epochs):
@@ -199,52 +203,79 @@ def main():
                 print(f"已保存 checkpoint 到: {current_checkpoint_path}")
         print("训练完成！")
     else:
+        # ========== 以下是推理阶段示例 ==========
+
+        dataset = DiffusionDataset(data_path)
+        dataloader = DataLoader(dataset, batch_size=1, shuffle=False)
+
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        seq_length = 7
+        latent_dim = 2
+
+        model = EncoderDecoderModelCBN(
+            input_channels=3, output_channels=3,
+            seq_length=seq_length, latent_dim=latent_dim
+        ).to(device)
+
+        # 加载已经训练完的权重
         checkpoint_path = os.path.join(output_data_dir, "model_checkpoint_epoch10000.pth")
         checkpoint = torch.load(checkpoint_path, map_location=device)
-        # 使用 strict=False 以允许部分加载权重
         model.load_state_dict(checkpoint["model_state_dict"], strict=True)
-        # 推理时，可以改变z以获得不同的预测结果
         model.eval()
+
+        # 随机取一个batch
         input_sample, target_sample = next(iter(dataloader))
         input_sample = input_sample.to(device)
 
+        # 目录准备
         output_dir = "output_images"
-        os.makedirs(output_dir, exist_ok=True)  # 如果目录不存在则创建
+        os.makedirs(output_dir, exist_ok=True)
 
-        for i in range(20):  # 只产生两个条件
-            if i %2 == 0:
-                # condition0: 全零向量
-                z = torch.zeros(input_sample.size(0), latent_dim, device=device)
-            else:
-                # condition1: 全一向量
-                z = torch.ones(input_sample.size(0), latent_dim, device=device)
+        # ========== 1. 保存 输入帧（仅示例第 1 张）==========
+        # input_sample.shape: (1, 3, 64, 64)
+        input_frame = input_sample[0]  # (3, 64, 64)
+        # [-1, 1] -> [0,1]
+        input_frame = (input_frame + 1.0) / 2.0
+        input_frame = input_frame.clamp(0, 1)
+        # 转到 [0,255] -> PIL
+        input_frame_pil = Image.fromarray(
+            (input_frame.cpu().permute(1, 2, 0).numpy() * 255).astype(np.uint8),
+            mode='RGB'
+        )
+        input_png_path = os.path.join(output_dir, "input_frame.png")
+        input_frame_pil.save(input_png_path)
+        print(f"已保存输入帧到: {input_png_path}")
 
-            # z = torch.randn(input_sample.size(0), latent_dim, device=device)
+        # ========== 2. 生成两种条件 (z=0, z=1) 输出序列并保存为 gif ==========
+        all_conditions = {
+            "z0": torch.zeros(input_sample.size(0), latent_dim, device=device),
+            "z1": torch.ones(input_sample.size(0), latent_dim, device=device)
+        }
 
-
+        for cond_name, z_vec in all_conditions.items():
             with torch.no_grad():
-                out_video = model(input_sample, z)  # (1, seq, c, h, w)
+                out_video = model(input_sample, z_vec)  # (1, 7, 3, 64, 64)
 
-            # out_video: (1, seq, 3, 64, 64)
-            # 去掉batch维度: (seq, 3, 64, 64)
+            # 去掉 batch 维度: (7, 3, 64, 64)
             video_frames = out_video.squeeze(0)
+            # 映射到 [0,1] 再到 [0,255]
+            video_frames = ((video_frames + 1.0) / 2.0).clamp(0, 1) * 255
+            video_frames = video_frames.byte()
 
-            # 将数据从[-1,1]映射到[0,1], 再转到[0,255]
-            video_frames = (video_frames + 1.0) / 2.0
-            video_frames = video_frames.clamp(0, 1) * 255.0
-            video_frames = video_frames.byte()  # 转为uint8
+            # 收集所有帧的 PIL Image
+            pil_frames = []
+            for frame_idx in range(video_frames.size(0)):
+                frame = video_frames[frame_idx]  # (3, 64, 64)
+                frame = frame.permute(1, 2, 0).cpu().numpy()  # (64, 64, 3)
+                pil_img = Image.fromarray(frame, mode='RGB')
+                pil_frames.append(pil_img)
 
-            # 遍历每一帧保存为png
-            seq_len = video_frames.size(0)
-            for frame_idx in range(seq_len):
-                frame = video_frames[frame_idx]  # (3, h, w)
-                frame = frame.permute(1, 2, 0).cpu().numpy()  # (h, w, c)
-                img = Image.fromarray(frame, mode='RGB')
-                frame_name = f"z{i}_frame{frame_idx+1}.png"
-                img_path = os.path.join(output_dir, frame_name)
-                img.save(img_path)
-                # print(f"已保存帧：{img_path}")
-        # out_video: (1, 7, 3, 64, 64) 不同的z会产生略有差异的结果
+            # 保存为 gif
+            gif_path = os.path.join(output_dir, f"{cond_name}_output.gif")
+            save_frames_as_gif(pil_frames, gif_path, duration=200)
+
+        generate_comparison_html(input_png_path, os.path.join(output_dir, "z0_output.gif"), os.path.join(output_dir, "z1_output.gif"), "compare.html")
+
 
 if __name__ == "__main__":
     main()
