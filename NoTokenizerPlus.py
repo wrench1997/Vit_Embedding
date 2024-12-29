@@ -1,7 +1,15 @@
 import torch
 from torch import nn
 from typing import Optional, List
-from utils.utils import find_entropy_patch_start_ids
+from utils.utils import find_entropy_patch_start_ids , _compute_sliding_entropy_incremental
+
+
+
+
+
+
+
+
 
 
 
@@ -65,45 +73,51 @@ class EntropyByteLatentTransformer(nn.Module):
         self.output = nn.Linear(dim, vocab_size, bias=False)
         
     def compute_entropy_features_vector(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        使用增量式统计而非 one-hot，对 x 中的每条序列做滑动窗口熵计算。
+        x: (B, L)，每个值取 [0..257], 其中 256=BOS, 257=EOS.
+        
+        返回: (B, L, 1)，其中第 i 个位置存储了从 i 到 i+window_size-1 这个窗口的熵（若末尾不足，则做简单填充）。
+        """
         B, L = x.shape
         window_size = self.window_size
+        vocab_size = 258  # 同上
+        
+        # 用来存储结果熵
+        entropy_features = torch.zeros(B, L, 1, device=x.device)
+        
+        for b in range(B):
+            # 取出第 b 条序列 (长度 L)
+            row = x[b]  # shape: (L,)
 
-        if L < window_size:
-            # 对于短序列，进行填充（例如，重复最后一个token）
-            pad_length = window_size - L
-            x_padded = torch.cat([x, x[:, -1:].repeat(1, pad_length)], dim=1)  # (B, window_size)
-            windows = x_padded.unfold(1, window_size, 1)  # (B, 1, window_size)
-        else:
-            windows = x.unfold(1, window_size, 1)  # (B, num_windows, window_size)
-
-        # windows 的形状为 (B, num_windows, window_size)
-
-        # 计算每个窗口的熵
-        # 使用one-hot编码
-        one_hot = torch.nn.functional.one_hot(windows, num_classes=258).float()  # (B, num_windows, window_size, 258)
-
-        # 将 BOS 和 EOS 标记映射到 0，以避免影响熵计算
-        one_hot[:, :, :, 256] = 0.0  # BOS
-        one_hot[:, :, :, 257] = 0.0  # EOS
-
-        # 计算每个窗口中每个字节的出现次数
-        counts = one_hot.sum(dim=2)  # (B, num_windows, 258)
-
-        # 计算概率
-        probs = counts / window_size  # (B, num_windows, 258)
-        probs = torch.clamp(probs, min=1e-10)  # 防止 log2(0)
-
-        # 计算熵
-        entropy = -torch.sum(probs * torch.log2(probs), dim=2, keepdim=True)  # (B, num_windows, 1)
-
-        # 初始化 entropy_features 为零
-        entropy_features = torch.zeros(B, L, 1, device=x.device)  # (B, L, 1)
-
-        # 将计算得到的熵赋值到对应的位置
-        num_windows = windows.shape[1]
-        entropy_features[:, :num_windows, :] = entropy  # (B, num_windows, 1) -> (B, L, 1)
-
+            # 如果这条序列长度 < window_size，做简单填充
+            if L < window_size:
+                pad_length = window_size - L
+                # 重复最后一个token
+                padded = torch.cat([row, row[-1:].repeat(pad_length)], dim=0)  # (window_size,)
+                entropies = _compute_sliding_entropy_incremental(
+                    padded, window_size, vocab_size, ignore_bos_eos=True
+                )
+                # 只把滑动窗口“第0个位置”的熵赋给原序列的 0~L-1
+                # 这里粗略些：整条序列用同一个窗口熵
+                entropy_val = entropies[0]
+                entropy_features[b, :, 0] = entropy_val
+            
+            else:
+                # 否则正常滑窗
+                entropies = _compute_sliding_entropy_incremental(
+                    row, window_size, vocab_size, ignore_bos_eos=True
+                )
+                # entropies的长度 = L（针对每个起点都有一个熵）
+                # 填到输出tensor
+                # 在下方 _compute_sliding_entropy_incremental() 里，如果 i + window_size 超过 L，
+                # 我们就做局部填充或只统计到序列末尾
+                entropy_features[b, :, 0] = entropies
+        
         return entropy_features
+
+
+
 
     def forward(
         self,

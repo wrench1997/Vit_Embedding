@@ -204,3 +204,73 @@ def find_entropy_patch_start_ids(
         (first_ids, patch_start_ids + preds_truncation_len), dim=1
     )
     return patch_start_ids
+
+
+
+def _compute_sliding_entropy_incremental(
+        sequence: torch.Tensor, 
+        window_size: int, 
+        vocab_size: int,
+        ignore_bos_eos: bool = True
+    ) -> torch.Tensor:
+        """
+        对单条序列 (长度 n) 进行增量式滑动窗口熵计算，返回每个位置的局部熵。
+        sequence: (n,)
+        返回: shape (n,) 的张量 entropies。
+
+        ignore_bos_eos=True 时，会将 BOS(256) / EOS(257) 的出现次数视为 0，不计入熵。
+        """
+        n = sequence.size(0)
+        entropies = torch.zeros(n, device=sequence.device, dtype=torch.float)
+        
+        # 计数器: 每个符号出现多少次
+        counts = torch.zeros(vocab_size, device=sequence.device, dtype=torch.float)
+        
+        # 辅助函数: 计算当前窗口的熵
+        def calc_entropy():
+            # 如果设置 ignore_bos_eos，需要把 BOS/EOS 的计数置0
+            c = counts.clone()
+            if ignore_bos_eos:
+                c[256] = 0.0  # BOS
+                c[257] = 0.0  # EOS
+            
+            total = c.sum()
+            if total < 1e-12:
+                return 0.0
+            
+            probs = c / total
+            # 避免 log(0)
+            probs = torch.clamp(probs, min=1e-12)
+            H = -torch.sum(probs * torch.log2(probs))
+            return H.item()
+        
+        # 1) 先把前 window_size 个符号放进计数器，如果不够 n，就取 min
+        init_win = min(window_size, n)
+        for i in range(init_win):
+            counts[sequence[i]] += 1
+        
+        # 2) 第 0 个位置对应 [0..window_size-1] 的窗口熵
+        entropies[0] = calc_entropy()
+        
+        # 3) 滑动窗口
+        for i in range(1, n):
+            start_idx = i
+            end_idx = i + window_size - 1
+            # 移除旧的
+            old_symbol = sequence[i - 1]
+            counts[old_symbol] -= 1
+            
+            if end_idx < n:
+                # 窗口还够
+                new_symbol = sequence[end_idx]
+                counts[new_symbol] += 1
+            else:
+                # 不够则做简单处理: 用最后一个符号重复填充
+                # 也可以选择 “窗口变小” 等其他策略
+                new_symbol = sequence[-1]
+                counts[new_symbol] += 1
+            
+            # 当前窗口熵
+            entropies[i] = calc_entropy()
+        
+        return entropies
