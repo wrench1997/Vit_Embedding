@@ -55,7 +55,7 @@ def compute_global_histogram(total_videos, min_seq_length, max_seq_length, chann
 
 def compute_video_entropy(video, global_hist, device='cuda'):
     """
-    计算单个视频相对于全局像素分布的熵。
+    计算单个视频相对于全局像素分布的交叉熵。
 
     参数:
         video (torch.Tensor): 输入视频数据，形状为 (seq_length, channels, height, width)
@@ -63,7 +63,7 @@ def compute_video_entropy(video, global_hist, device='cuda'):
         device (str): 使用的设备（'cuda' 或 'cpu'）
 
     返回:
-        float: 单个视频的熵 (bits)
+        float: 单个视频的交叉熵 (bits)
     """
     if device != 'cpu':
         global_hist = global_hist.to(device)
@@ -73,15 +73,18 @@ def compute_video_entropy(video, global_hist, device='cuda'):
     pixels = video.view(-1).long()
     video_hist = torch.bincount(pixels, minlength=256).float()
 
+    # 计算视频的概率分布
+    p_video = video_hist / video_hist.sum()
+
     # 计算全局概率分布
-    global_prob = global_hist / global_hist.sum()
+    p_global = global_hist / global_hist.sum()
 
-    # 计算视频中每个像素值出现的概率（基于全局分布）
-    video_prob = global_prob[pixels]
+    # 为避免 log2(0) 错误，添加一个小的 epsilon
+    epsilon = 1e-10
+    p_global = p_global + epsilon
 
-    # 计算熵，过滤掉概率为零的值
-    video_prob_nonzero = video_prob[video_prob > 0]
-    entropy = -(torch.log2(video_prob_nonzero)).mean().item() # 使用平均值作为视频的熵
+    # 计算交叉熵
+    entropy = -(p_video * torch.log2(p_global)).sum().item()  # 单位：bits
 
     return entropy
 
@@ -123,7 +126,7 @@ def main():
         device='cpu'
     )  # 形状: (seq_length, channels, height, width)
 
-    print("\n开始计算单个视频的熵...")
+    print("\n开始计算单个视频的交叉熵...")
     start_time = time.time()
     video_entropy = compute_video_entropy(
         video=input_video,
@@ -131,8 +134,8 @@ def main():
         device=device
     )
     computation_time = time.time() - start_time
-    print(f"单个视频熵计算完成，耗时: {computation_time:.2f} 秒")
-    print(f"单个视频相对于全局分布的熵: {video_entropy:.4f} bits")
+    print(f"单个视频交叉熵计算完成，耗时: {computation_time:.2f} 秒")
+    print(f"单个视频相对于全局分布的交叉熵: {video_entropy:.4f} bits")
 
 if __name__ == "__main__":
     main()
