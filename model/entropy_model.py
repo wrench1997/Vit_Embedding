@@ -23,37 +23,6 @@ except ImportError:
     # 你可以在这里自定义一个空 flex_attention 或抛异常
 
 
-
-def generate_synthetic_data(batch_size, S_original, C, H, W, vocab_size, fixed_value=128, fixed_entropy_class=128):
-    """
-    生成固定的合成数据，其中所有 x 都是相同的值，y 是固定的类别标签。
-    
-    Args:
-        batch_size (int): 批次大小。
-        S_original (int): 序列长度。
-        C (int): 通道数。
-        H (int): 高度。
-        W (int): 宽度。
-        vocab_size (int): 词汇表大小（离散化的类别数）。
-        fixed_value (int): 所有像素的固定值。
-        fixed_entropy_class (int): 固定的熵类别标签。
-    
-    Returns:
-        x (torch.Tensor): 输入数据，形状为 (B, S, C, H, W)。
-        y (torch.Tensor): 目标数据，形状为 (B, S)。
-    """
-    # 创建固定的图像数据
-    x = torch.full((batch_size, S_original, C, H, W), fixed_value, dtype=torch.int64)  # (B, S, C, H, W)
-    
-    # 创建固定的目标标签
-    y = torch.full((batch_size, S_original), fixed_entropy_class, dtype=torch.long)  # (B, S)
-    
-    return x, y
-
-
-
-
-
 def compute_entropy(x, num_bins=256):
     """
     计算每个图像的熵，并将其离散化为类别标签。
