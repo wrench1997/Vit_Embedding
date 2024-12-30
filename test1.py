@@ -1,65 +1,52 @@
 import torch
-import time
-import random
+import torch.nn.functional as F
+from math import log2
 
-def generate_single_video(seq_length, channels, height, width, device='cuda'):
-    video = torch.randint(0, 256, (seq_length, channels, height, width), dtype=torch.uint8, device=device)
-    return video
+def calculate_entropy(probabilities, epsilon=1e-8):
+    """计算熵值，处理概率为 0 的情况."""
+    probabilities = probabilities[probabilities > 0]  # 移除概率为 0 的项
+    return -torch.sum(probabilities * torch.log2(probabilities + epsilon))
 
-def compute_single_video_entropy(video, device='cuda'):
+def calculate_motion_entropy_tensor_windowed(video_tensor, window_size=5):
     """
-    计算单个视频自身的熵。
+    计算视频 Tensor 的运动信息熵 (滑动窗口)。
 
-    参数:
-        video (torch.Tensor): 输入视频数据，形状为 (seq_length, channels, height, width)
-        device (str): 使用的设备（'cuda' 或 'cpu'）
+    Args:
+        video_tensor (torch.Tensor): 形状为 (T, C, H, W) 的视频 Tensor。
+        window_size (int): 滑动窗口的大小。
 
-    返回:
-        float: 单个视频的熵 (bits)
+    Returns:
+        torch.Tensor: 每个时间步的运动信息熵 Tensor，形状为 (T-window_size+1,)。
     """
-    if device != 'cpu':
-        video = video.to(device)
+    T, C, H, W = video_tensor.shape
+    motion_entropy = []
 
-    # 计算输入视频的像素直方图
-    pixels = video.view(-1).long()
-    video_hist = torch.bincount(pixels, minlength=256).float()
+    for t in range(T - window_size + 1):
+        # 计算窗口内相邻帧之间的差异 (绝对值)
+        window_diffs = []
+        for i in range(window_size - 1):
+            frame_diff = torch.abs(video_tensor[t + i + 1] - video_tensor[t + i])
+            window_diffs.append(frame_diff.flatten())
 
-    # 计算视频的概率分布
-    total_pixels = video_hist.sum()
-    if total_pixels == 0:  # 处理视频为空的情况
-        return 0.0
-    p_video = video_hist / total_pixels
+        # 将差异值展平并计算其概率分布
+        diff_flat = torch.cat(window_diffs)
+        probs = torch.histc(diff_flat.float(), bins=1024, min=0, max=255).float()
+        probs = probs / torch.sum(probs)
 
-    # 计算熵
-    epsilon = 1e-10
-    log_probs = torch.log2(p_video + epsilon) # 加 epsilon 避免 log2(0)
-    entropy = -torch.sum(p_video * log_probs).item()
+        # 计算熵
+        entropy = calculate_entropy(probs)
+        motion_entropy.append(entropy)
 
-    return entropy
+    return torch.stack(motion_entropy)
 
-def main():
-    # 配置单个输入视频的参数
-    seq_length = 100
-    channels = 3
-    height = 64
-    width = 64
-    device = 'cuda:1' if torch.cuda.is_available() else 'cpu'
-
-    # 生成一个随机输入视频作为示例
-    input_video = generate_single_video(
-        seq_length=seq_length,
-        channels=channels,
-        height=height,
-        width=width,
-        device=device
-    )
-
-    print("\n开始计算单个视频的自身熵...")
-    start_time = time.time()
-    video_entropy = compute_single_video_entropy(input_video, device=device)
-    computation_time = time.time() - start_time
-    print(f"单个视频自身熵计算完成，耗时: {computation_time:.4f} 秒")
-    print(f"单个视频的自身熵: {video_entropy:.4f} bits")
-
+# 示例用法
 if __name__ == "__main__":
-    main()
+    # 创建一个随机的视频 Tensor (T, C, H, W)
+    T, C, H, W = 1024, 3, 64, 64
+    video = torch.randint(low=0,high=255,size=(T, C, H, W), dtype=torch.int64)
+
+    # 计算窗口化的运动信息熵
+    window_size = 10
+    motion_entropy_windowed = calculate_motion_entropy_tensor_windowed(video, window_size)
+    print(f"窗口大小为 {window_size} 的运动信息熵 (每个时间步):", motion_entropy_windowed)
+    print("平均运动信息熵 (窗口化):", torch.mean(motion_entropy_windowed))

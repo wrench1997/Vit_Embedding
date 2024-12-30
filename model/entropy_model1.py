@@ -168,7 +168,7 @@ def main():
             num_videos=100,
             seq_length=SEQ_LENGTH,
             frame_size=FRAME_SIZE,
-            pattern='moving_square'  # 可以尝试不同的 pattern 进行测试
+            pattern='random'  # ‘random ’ ‘moving_square’ 可以尝试不同的 pattern 进行测试
         )
         test_dataloader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=2)
 
