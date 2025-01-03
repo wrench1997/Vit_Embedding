@@ -5,6 +5,49 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
+try:
+    from torch.nn.attention.flex_attention import (
+        BlockMask,
+        flex_attention,
+        _mask_mod_signature,
+    )
+    FLEX_AVAILABLE = True
+except ImportError:
+    FLEX_AVAILABLE = False
+
+
+# from torch.nn.attention.flex_attention import create_block_mask
+
+# def causal(b, h, q_idx, kv_idx):
+#     return q_idx >= kv_idx
+
+# # Because the sparsity pattern is independent of batch and heads, we'll set them to None (which broadcasts them) 
+# block_mask = create_block_mask(causal, B=None, H=None, Q_LEN=1024, KV_LEN=1024)
+# # In this case, we don't need a score_mod, so we won't pass any in.
+# # However, score_mod can still be combined with block_mask if you need the additional flexibility.
+# flex_attention(query, key, value, block_mask=block_mask)    
+
+
+
+
+SLIDING_WINDOW = 1024
+
+
+def causal_mask(b, h, q_idx, kv_idx):
+     return q_idx >= kv_idx
+
+def sliding_window_causal(b, h, q_idx, kv_idx):
+    causal_mask = q_idx >= kv_idx
+    window_mask = q_idx - kv_idx <= SLIDING_WINDOW 
+    return causal_mask & window_mask
+
+# If you want to be cute...
+from torch.nn.attention import or_masks
+
+def sliding_window(b, h, q_idx, kv_idx):
+    return q_idx - kv_idx <= SLIDING_WINDOW
+
+sliding_window_causal = or_masks(causal_mask, sliding_window)
 
 ################################################################################
 # 1) RoPE相关函数: precompute_freqs_cis + RotaryEmbedding + apply_rotary_emb
