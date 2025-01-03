@@ -567,7 +567,7 @@ def main():
             x = x.to(device)
             y = y.to(device)
             loss, logits = model(x, target=y, block_mask=None)
-
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         
             # Backward pass and optimization
             optimizer.zero_grad()
             loss.backward()
