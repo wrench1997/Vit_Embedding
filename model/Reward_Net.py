@@ -12,9 +12,9 @@ import torch.distributions as distributions
 class KeyFrameEnv(gym.Env):
     """
     自定义环境，代理需要执行特定的动作组合才能获得奖励。
-    动作是离散的,需要按正确顺序执行才能结束游戏。
+    动作是离散的，需要按正确顺序执行才能结束游戏。
     """
-    def __init__(self, seq_length=10, frame_dim=128):
+    def __init__(self, seq_length=4, frame_dim=128):
         super().__init__()
         self.seq_length = seq_length
         self.frame_dim = frame_dim
@@ -55,7 +55,7 @@ class KeyFrameEnv(gym.Env):
         
         # 检查是否完成目标序列
         if len(self.action_history) >= len(self.target_sequence):
-            # 获取最近的n个动作,其中n是目标序列长度
+            # 获取最近的n个动作，其中n是目标序列长度
             recent_actions = self.action_history[-len(self.target_sequence):]
             
             # 检查是否匹配目标序列
@@ -85,21 +85,39 @@ class KeyFrameEnv(gym.Env):
 # 2. 策略网络定义
 # ------------------------------
 class PolicyNetwork(nn.Module):
-    def __init__(self, frame_dim=128, hidden_dim=64):
+    def __init__(self, frame_dim=128, hidden_dim=128, num_layers=2, bidirectional=True):
         super(PolicyNetwork, self).__init__()
-        self.hidden_size = hidden_dim
-        self.lstm = nn.LSTMCell(frame_dim, hidden_dim)
-        self.fc = nn.Linear(hidden_dim, 1)  # 输出选择概率
+        self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
+        self.bidirectional = bidirectional
+        self.num_directions = 2 if bidirectional else 1
+        
+        # 多层双向 LSTM
+        self.lstm = nn.LSTM(
+            input_size=frame_dim,
+            hidden_size=hidden_dim,
+            num_layers=num_layers,
+            batch_first=True,
+            bidirectional=bidirectional
+        )
+        
+        # 全连接层，输出动作概率
+        self.fc = nn.Linear(hidden_dim * self.num_directions, 4)  # 4个动作
+        
+        # Softmax 层，用于多分类
+        self.softmax = nn.Softmax(dim=-1)
     
-    def forward(self, x, hidden):
+    def forward(self, x, hidden=None):
         """
-        x: [batch_size, frame_dim]
-        hidden: Tuple of (hx, cx) each of shape [batch_size, hidden_dim]
+        x: [batch_size, seq_length, frame_dim]
+        hidden: Tuple of (h0, c0)
         """
-        hx, cx = self.lstm(x, hidden)
-        logits = self.fc(hx)  # [batch_size, 1]
-        probs = torch.sigmoid(logits)  # [batch_size, 1]
-        return probs, (hx, cx)
+        lstm_out, hidden = self.lstm(x, hidden)  # lstm_out: [batch, seq_len, hidden_dim * num_directions]
+        # 取最后一个时间步的输出
+        last_output = lstm_out[:, -1, :]  # [batch, hidden_dim * num_directions]
+        logits = self.fc(last_output)  # [batch, 4]
+        probs = self.softmax(logits)  # [batch, 4]
+        return probs, hidden
 
 # ------------------------------
 # 3. 训练循环
@@ -113,46 +131,58 @@ def train_policy_gradient(env, policy_net, optimizer, num_episodes=1000, gamma=1
     - policy_net: 策略网络
     - optimizer: 优化器
     - num_episodes: 训练回合数
-    - gamma: 折扣因子（由于奖励仅在回合结束时给予，gamma=1.0）
+    - gamma: 折扣因子
     """
-    for episode in range(num_episodes):
-        observation,_ = env.reset()
-        log_probs = []
-        selected_actions = []
+    policy_net.train()
+    for episode in range(1, num_episodes + 1):
+        observation, _ = env.reset()
         done = False
-        total_reward = 0
-        # 初始化隐藏状态
-        hx = torch.zeros(1, policy_net.hidden_size)
-        cx = torch.zeros(1, policy_net.hidden_size)
-        hidden = (hx, cx)
+        rewards = []
+        log_probs = []
+        actions = []
+        state = observation[np.newaxis, :]  # [1, frame_dim]
         while not done:
-            # 将观察转换为张量
-            obs_tensor = torch.from_numpy(observation).float().unsqueeze(0)  # [1, frame_dim]
-            # 获取动作概率
-            probs, hidden = policy_net(obs_tensor, hidden)
-            prob = probs.squeeze(0)  # [1]
-            # 采样动作
-            m = distributions.Bernoulli(prob)
-            action = m.sample()
-            log_prob = m.log_prob(action)
+            state_tensor = torch.from_numpy(state).float().unsqueeze(0)  # [1, 1, frame_dim]
+            # 前向传播
+            probs, _ = policy_net(state_tensor)  # probs: [1, 4]
+            m = distributions.Categorical(probs)
+            action = m.sample()  # [1]
+            log_prob = m.log_prob(action)  # [1]
             log_probs.append(log_prob)
-            selected_actions.append(action.item())
-            # 执行动作
+            actions.append(action.item())
+            # 环境交互
             observation, reward, done, info = env.step(action.item())
-        # 获取回合总奖励
-        total_reward = reward  # 标量
-        # 计算策略损失
+            rewards.append(reward)
+            state = observation[np.newaxis, :]  # [1, frame_dim]
+        
+        # 计算累计折扣奖励
+        G = 0
+        returns = []
+        for r in reversed(rewards):
+            G = r + gamma * G
+            returns.insert(0, G)
+        returns = torch.tensor(returns)
+        # 标准化 returns
+        if returns.std() != 0:
+            returns = (returns - returns.mean()) / (returns.std() + 1e-8)
+        else:
+            returns = returns - returns.mean()
+        
+        # 计算损失
         policy_loss = []
-        for log_prob in log_probs:
-            policy_loss.append(-log_prob * total_reward)
-        policy_loss = torch.stack(policy_loss).sum()
-        # 更新策略网络
+        for log_prob, Gt in zip(log_probs, returns):
+            policy_loss.append(-log_prob * Gt)
+        policy_loss = torch.cat(policy_loss).sum()
+        
+        # 优化策略网络
         optimizer.zero_grad()
         policy_loss.backward()
         optimizer.step()
+        
         # 日志记录
-        if (episode+1) % 100 == 0:
-            print(f"Episode {episode+1}\tReward: {total_reward}\tSelected: {selected_actions}")
+        if episode % 100 == 0:
+            success = info.get('success', False)
+            print(f"Episode {episode}\tReward: {info.get('success', False)}\tActions: {actions}\tSuccess: {success}")
     print("Training completed.")
 
 # ------------------------------
@@ -167,30 +197,26 @@ def evaluate_policy(env, policy_net, num_episodes=10):
     - policy_net: 策略网络
     - num_episodes: 评估回合数
     """
+    policy_net.eval()
     success = 0
-    for episode in range(num_episodes):
-        observation,_ = env.reset()
-        selected_actions = []
-        done = False
-        # 初始化隐藏状态
-        hx = torch.zeros(1, policy_net.hidden_size)
-        cx = torch.zeros(1, policy_net.hidden_size)
-        hidden = (hx, cx)
-        while not done:
-            # 将观察转换为张量
-            obs_tensor = torch.from_numpy(observation).float().unsqueeze(0)  # [1, frame_dim]
-            # 获取动作概率
-            probs, hidden = policy_net(obs_tensor, hidden)
-            prob = probs.squeeze(0)  # [1]
-            # 选择动作（贪婪策略）
-            action = (prob > 0.5).float()
-            selected_actions.append(action.item())
-            # 执行动作
-            observation, reward, done, info = env.step(action.item())
-        # 检查是否成功
-        if (info['true_positives'] == env.num_key_frames) and (info['false_positives'] == 0):
-            success +=1
-        print(f"Episode {episode+1}\tReward: {reward}\tSelected: {selected_actions}\tKey Frames: {info['key_frames']}")
+    with torch.no_grad():
+        for episode in range(1, num_episodes + 1):
+            observation, _ = env.reset()
+            done = False
+            actions = []
+            state = observation[np.newaxis, :]  # [1, frame_dim]
+            while not done:
+                state_tensor = torch.from_numpy(state).float().unsqueeze(0)  # [1, 1, frame_dim]
+                probs, _ = policy_net(state_tensor)  # probs: [1, 4]
+                action = torch.argmax(probs, dim=1).item()
+                actions.append(action)
+                # 环境交互
+                observation, reward, done, info = env.step(action)
+                state = observation[np.newaxis, :]  # [1, frame_dim]
+            # 检查是否成功
+            if info.get('success', False):
+                success += 1
+            print(f"Episode {episode}\tActions: {actions}\tSuccess: {info.get('success', False)}")
     print(f"Success rate: {success}/{num_episodes}")
 
 # ------------------------------
@@ -200,16 +226,16 @@ if __name__ == "__main__":
     # 设置随机种子以确保可复现性
     np.random.seed(42)
     torch.manual_seed(42)
-    
+
     # 初始化环境和策略网络
-    env = KeyFrameEnv(seq_length=10, frame_dim=128)
-    policy_net = PolicyNetwork(frame_dim=128, hidden_dim=64)
+    env = KeyFrameEnv(seq_length=4, frame_dim=128)
+    policy_net = PolicyNetwork(frame_dim=128, hidden_dim=128, num_layers=2, bidirectional=True)
     optimizer = optim.Adam(policy_net.parameters(), lr=1e-3)
-    
+
     # 训练策略网络
     print("开始训练策略网络...")
-    train_policy_gradient(env, policy_net, optimizer, num_episodes=10000, gamma=1.0)
-    
+    train_policy_gradient(env, policy_net, optimizer, num_episodes=10000, gamma=0.99)
+
     # 评估策略网络
     print("\n评估训练好的策略网络...")
     evaluate_policy(env, policy_net, num_episodes=20)
